@@ -17,7 +17,7 @@ parser.add_argument('--model', default='ours_small', type=str)
 parser.add_argument('--H', default=256, type=int)
 parser.add_argument('--W', default=256, type=int)
 args = parser.parse_args()
-assert args.model in ['ours', 'ours_small'], 'Model not exists!'
+# assert args.model in ['ours', 'ours_small'], 'Model not exists!'
 
 '''==========Model setting=========='''
 TTA = True
@@ -28,8 +28,14 @@ if args.model == 'ours_small':
         F = 16,
         depth = [2, 2, 2, 2, 2]
     )
+elif args.model == 'hybrid_v1_baseline':
+    TTA = False
+    # Use config from config.py directly, or ensure it matches
+    cfg.MODEL_CONFIG['LOGNAME'] = 'hybrid_v1_baseline'
+    # MODEL_ARCH is already set in config.py for this default
 else:
     cfg.MODEL_CONFIG['LOGNAME'] = 'ours'
+
     cfg.MODEL_CONFIG['MODEL_ARCH'] = cfg.init_model_config(
         F = 32,
         depth = [2, 2, 2, 4, 4]

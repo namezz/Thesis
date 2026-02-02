@@ -33,9 +33,16 @@ Input Features ------+                                          +-- Fusion (1x1 
 - **Target**: SNU-FILM Extreme >= +1.0 dB over Phase 1
 
 ### Phase 3: High-Fidelity Synthesis (X4K)
-- **Goal**: 4K texture preservation via mixed training
-- **Key Strategy**: Curriculum learning + temporal subsampling
-- **Target**: Competitive X-TEST 4K performance
+*   **Goal:** 4K Texture Preservation & Multi-scale Adaptability.
+*   **Training Strategy:**
+    *   **Dataset:** Vimeo90K + X4K1000FPS.
+    *   **Ratio:** 1:1 or 2:1 (Vimeo dominant).
+    *   **Patch Size:** 256x256.
+    *   **Augmentation:** Temporal Subsampling (Stride 8~32) for X4K to simulate large motion.
+*   **Evaluation Protocol:**
+    1.  **Basic (Vimeo90K/UCF101/Middlebury):** Ensure no performance drop (verify mixed training safety).
+    2.  **Highlight (SNU-FILM Hard/Extreme):** Leverage X4K large-stride training to reduce edge blur in large motion.
+    3.  **Efficiency/Quality (X4K-Test):** Demonstrate superior texture recovery compared to Vimeo-only SOTA.
 
 ## Project Structure
 
@@ -68,29 +75,27 @@ Thesis-VFI/
 +-- figs/                      # Paper figures & visualizations
 ```
 
-## Usage
+## 🚀 Usage
+
+### Unit Testing (Dry Run)
+Before starting full training, run a unit test to verify the model and dataset:
+```bash
+python unit_test_train.py --data_path /path/to/vimeo_septuplet
+```
 
 ### Training
-
 ```bash
-# Phase 1: Hybrid backbone on Vimeo90K (4 GPUs)
-python -m torch.distributed.launch --nproc_per_node=4 train.py \
-    --world_size 4 --batch_size 24 \
-    --data_path /path/to/vimeo90k --phase 1
-
-# Phase 2: Add flow module (fine-tune from Phase 1)
-python -m torch.distributed.launch --nproc_per_node=4 train.py \
-    --world_size 4 --batch_size 24 \
-    --data_path /path/to/vimeo90k --phase 2 \
-    --resume ckpt/phase1_best.pkl
-
-# Phase 3: Mixed training with X4K (curriculum learning)
-python -m torch.distributed.launch --nproc_per_node=4 train.py \
-    --world_size 4 --batch_size 16 \
-    --data_path /path/to/vimeo90k \
-    --x4k_path /path/to/X4K1000FPS \
-    --phase 3 --resume ckpt/phase2_best.pkl --curriculum
+# Distributed training on 4 GPUs
+python -m torch.distributed.launch --nproc_per_node=4 train.py --world_size 4 --batch_size 8 --data_path /path/to/vimeo90k
 ```
+
+### Visualization
+*   **TensorBoard:** Training and validation metrics (Loss, PSNR, Learning Rate) are automatically logged.
+    ```bash
+    tensorboard --logdir log/
+    ```
+    Access via `http://localhost:6006`.
+*   **TQDM:** A progress bar is displayed in the terminal during training and evaluation to show real-time progress and estimated completion time.
 
 ### Evaluation
 

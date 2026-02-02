@@ -17,27 +17,17 @@ from Trainer import Model
 from benchmark.utils.pytorch_msssim import ssim_matlab
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--model', default='ours', type=str)
+parser.add_argument('--model', default='hybrid_v1_baseline', type=str)
 parser.add_argument('--path', type=str, required=True)
 args = parser.parse_args()
-assert args.model in ['ours', 'ours_small'], 'Model not exists!'
-
 
 '''==========Model setting=========='''
-TTA = True
-if args.model == 'ours_small':
-    TTA = False
-    cfg.MODEL_CONFIG['LOGNAME'] = 'ours_small'
-    cfg.MODEL_CONFIG['MODEL_ARCH'] = cfg.init_model_config(
-        F = 16,
-        depth = [2, 2, 2, 2, 2]
-    )
+TTA = False
+if args.model == 'hybrid_v1_baseline':
+    cfg.MODEL_CONFIG['LOGNAME'] = 'hybrid_v1_baseline'
 else:
-    cfg.MODEL_CONFIG['LOGNAME'] = 'ours'
-    cfg.MODEL_CONFIG['MODEL_ARCH'] = cfg.init_model_config(
-        F = 32,
-        depth = [2, 2, 2, 4, 4]
-    )
+    cfg.MODEL_CONFIG['LOGNAME'] = args.model
+
 model = Model(-1)
 model.load_model()
 model.eval()

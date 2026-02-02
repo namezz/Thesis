@@ -274,9 +274,21 @@ I_0, I_1 (B, 3, H, W) + timestep t
 
 ---
 
-### 第三階段：高解析度紋理注入 (Phase 3: 4K with X4K)
+### 第三階段：高解析度紋理注入 (Phase 3: High-Fidelity Synthesis with X4K)
+**目標**：透過 **X4K1000FPS** 資料集與特殊訓練策略，賦予模型處理 4K 影像的能力，從「插補準確」提升至「紋理逼真」。
 
-(內容同前，省略重複，詳見 Phase 3 執行協議)
+#### 3.1 實驗配置與預期貢獻矩陣 (Experimental Protocol & Contributions)
+
+| 階段 (Stage) | 資料集 (Dataset) | 關鍵操作細節 (Key Operations) | 預期帶來的論文貢獻 (Contribution) |
+| :--- | :--- | :--- | :--- |
+| **訓練 (Train)** | **Vimeo90K + X4K1000FPS** | **混合比例**：建議 **1:1** 或 **2:1** (Vimeo佔多)。<br>**Patch Size**：**256x256**。<br>**Augmentation**：對 X4K 做**時間跳幀 (Stride 8~32)**。 | 1. **多尺度適應性**：證明模型能同時處理低畫質與 4K 畫質。<br>2. **細節增強**：Mamba 模組能從 X4K 學到更好的紋理修復能力。 |
+| **評估 1 (基礎)** | Vimeo90K-Test, UCF101, Middlebury | (維持不變) | **確保基礎分數 (PSNR/SSIM) 不掉**：證明混合訓練沒有副作用，維持模型在標準解析度下的通用性。 |
+| **評估 2 (亮點)** | **SNU-FILM (Hard/Extreme)** | (維持不變) | **光流 Block 的主戰場**：加上 X4K 的大位移訓練 (Stride 32) 有助於顯著減少大動作下的邊緣模糊與鬼影。 |
+| **評估 3 (效率/畫質)** | **X4K1000FPS-Test** | (維持不變) | **超高解析度優勢**：由於訓練集包含 X4K，理論上此處分數 (PSNR/SSIM/LPIPS) 將大幅超越僅用 Vimeo 訓練的 SOTA 模型。 |
+
+#### 3.2 執行策略備註
+*   **混合訓練策略**：將這兩個性質差異巨大的資料集放在一起訓練，利用 Random Crop 解決解析度落差，並利用 Temporal Subsampling 解決 X4K 原生動作過小的問題。
+*   **IO 優化**：X4K 訓練時務必預先處理資料 (Resize/Crop/LMDB)，否則 GPU 會因為等待硬碟讀取而閒置。
 
 ---
 
