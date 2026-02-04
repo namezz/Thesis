@@ -20,7 +20,9 @@ class Model:
         self.vgg_loss = VGGPerceptualLoss()
         
         if local_rank != -1:
-            self.net = DDP(self.net, device_ids=[local_rank], output_device=local_rank)
+            # find_unused_parameters=True is needed for conditional architecture (ablation modes)
+            self.net = DDP(self.net, device_ids=[local_rank], output_device=local_rank, 
+                          find_unused_parameters=True)
 
     def train(self):
         self.net.train()
@@ -51,15 +53,21 @@ class Model:
 
     @torch.no_grad()
     def inference(self, img0, img1, TTA=False, timestep=0.5, fast_TTA=False):
-        # Wrapper for benchmark scripts
-        # Returns tuple (pred,) for compatibility
-        pred = self.net.inference(img0, img1, TTA=TTA, timestep=timestep)
-        return (pred,)  # Return as tuple for unpacking in benchmarks
+        """
+        Wrapper for benchmark scripts.
+        Returns tuple (pred,) for compatibility.
+        """
+        pred = self.net.inference(img0, img1, TTA=TTA, timestep=timestep, fast_TTA=fast_TTA)
+        return (pred,)
 
     @torch.no_grad()
     def hr_inference(self, img0, img1, TTA=False, down_scale=1.0, timestep=0.5, fast_TTA=False):
-        # High-resolution inference with optional downscaling for flow estimation
-        pred = self.net.inference(img0, img1, TTA=TTA, scale=down_scale, timestep=timestep)
+        """
+        High-resolution inference with optional downscaling for flow estimation.
+        Recommended: down_scale=0.5 for 2K, down_scale=0.25 for 4K.
+        """
+        pred = self.net.inference(img0, img1, TTA=TTA, scale=down_scale, timestep=timestep, fast_TTA=fast_TTA)
+        return (pred,)
         return (pred,)  # Return as tuple for unpacking in benchmarks
     
     def update(self, imgs, gt, learning_rate=0, training=True):
