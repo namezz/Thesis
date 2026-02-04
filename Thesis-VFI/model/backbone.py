@@ -9,12 +9,13 @@ except ImportError:
     print("Warning: Mamba2 not found. Using placeholder or falling back.")
     Mamba2 = None # Handle gracefully or ensure env is correct
 
-from .utils import window_partition, window_reverse, Mlp
+from .utils import window_partition, window_reverse, Mlp, ECAB, scan_images, merge_images, ManifoldResConnection
 
 class GatedWindowAttention(nn.Module):
     """
     Window based multi-head self-attention (W-MSA) with gating mechanism.
     Ref: Gated Attention (NeurIPS 2025)
+    Uses FlashAttention-2 via F.scaled_dot_product_attention.
     """
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
@@ -33,38 +34,41 @@ class GatedWindowAttention(nn.Module):
         self.gate = nn.Linear(dim, num_heads) 
         self.sigmoid = nn.Sigmoid()
 
-        self.softmax = nn.Softmax(dim=-1)
-
     def forward(self, x, mask=None):
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
-
+        attn_mask = mask
         if mask is not None:
+            # mask shape: (nW, N, N) where nW is number of windows
+            # B_ = BatchSize * nW
             nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-            
-        attn = self.softmax(attn)
-        attn = self.attn_drop(attn)
+            # Expand mask to (BatchSize*nW, 1, N, N) to match q, k, v batch dim
+            # We repeat the mask for each image in the batch
+            attn_mask = mask.unsqueeze(1).unsqueeze(0) # (1, nW, 1, N, N)
+            attn_mask = attn_mask.repeat(B_ // nW, 1, 1, 1, 1) # (B, nW, 1, N, N)
+            attn_mask = attn_mask.view(-1, 1, N, N) # (B_, 1, N, N)
 
-        # Standard Attention Output
-        x_attn = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        # FlashAttention-2 (Scaled Dot Product Attention)
+        # dropout_p is handled internally. mask can be additive or boolean.
+        x_attn = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=attn_mask, 
+            dropout_p=self.attn_drop.p if self.training else 0., 
+            scale=self.scale
+        )
+        
+        # Reshape back: (B_, num_heads, N, head_dim) -> (B_, N, num_heads, head_dim) -> (B_, N, C)
+        x_attn = x_attn.transpose(1, 2).reshape(B_, N, C)
         
         # Gated Attention Mechanism
         # Gate calculation: (B_, N, C) -> (B_, N, num_heads)
         gate_score = self.sigmoid(self.gate(x)) 
-        # Expand gate to match C: (B, N, heads, 1) * (B, N, heads, head_dim) logic roughly
-        # Reshape gate to apply per head
-        gate_score = gate_score.unsqueeze(-1) # (B, N, heads, 1)
+        # Reshape gate to apply per head: (B_, N, heads, 1)
+        gate_score = gate_score.unsqueeze(-1) 
         
-        # We need to apply this to the head output before reshaping back to C, 
-        # or we can apply it after if we reshape x_attn back to heads.
-        # Let's do it before the final reshape in a real implementation, but here x_attn is already (B,N,C).
-        # Let's reshape x_attn to (B, N, heads, head_dim) to apply gate
+        # Apply gate
         x_attn_heads = x_attn.view(B_, N, self.num_heads, C // self.num_heads)
         x_attn_gated = x_attn_heads * gate_score
         x_attn = x_attn_gated.reshape(B_, N, C)
@@ -76,19 +80,27 @@ class GatedWindowAttention(nn.Module):
 class LGSBlock(nn.Module):
     """
     Local-Global Synergistic Block
-    Branch A: Mamba2 (SSD) for Global Context
+    Branch A: Mamba2 (SSD) for Global Context with SS2D Scanning
     Branch B: Gated Window Attention for Local Texture
+    Fusion: ECAB (Efficient Channel Attention)
+    
+    Supports ablation modes:
+    - 'hybrid': Both branches (default)
+    - 'mamba2_only': Only Mamba2 branch
+    - 'gated_attn_only': Only Gated Window Attention branch
     """
     def __init__(self, dim, num_heads, window_size=7, shift_size=0, mlp_ratio=4., 
                  drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 mamba_d_state=64, mamba_d_conv=4, mamba_expand=2):
+                 mamba_d_state=64, mamba_d_conv=4, mamba_expand=2, use_mhc=False,
+                 backbone_mode='hybrid', use_ecab=True):
         super().__init__()
         self.dim = dim
+        self.backbone_mode = backbone_mode
         self.norm1 = norm_layer(dim)
         
-        # Branch A: Mamba2
-        # Note: Mamba2 expects (B, L, C). We will flatten spatial dims.
-        if Mamba2 is not None:
+        # Branch A: Mamba2 (only if hybrid or mamba2_only)
+        self.use_mamba = backbone_mode in ['hybrid', 'mamba2_only']
+        if self.use_mamba and Mamba2 is not None:
             self.mamba = Mamba2(
                 d_model=dim,
                 d_state=mamba_d_state,
@@ -96,17 +108,44 @@ class LGSBlock(nn.Module):
                 expand=mamba_expand
             )
         else:
-            self.mamba = nn.Identity() # Fallback
+            self.mamba = nn.Identity() if self.use_mamba else None
 
-        # Branch B: Gated Window Attention
+        # Branch B: Gated Window Attention (only if hybrid or gated_attn_only)
+        self.use_attn = backbone_mode in ['hybrid', 'gated_attn_only']
         self.window_size = window_size
         self.shift_size = shift_size
-        self.attn = GatedWindowAttention(
-            dim, window_size=window_size, num_heads=num_heads,
-            qkv_bias=True, qk_scale=None, attn_drop=attn_drop, proj_drop=drop)
+        if self.use_attn:
+            self.attn = GatedWindowAttention(
+                dim, window_size=window_size, num_heads=num_heads,
+                qkv_bias=True, qk_scale=None, attn_drop=attn_drop, proj_drop=drop)
+        else:
+            self.attn = None
 
-        # Fusion
-        self.fusion_conv = nn.Conv2d(dim * 2, dim, 1) # 1x1 conv to merge branches
+        # Fusion & Mixing
+        self.use_mhc = use_mhc
+        if backbone_mode == 'hybrid':
+            if use_mhc:
+                self.mhc = ManifoldResConnection(dim, num_streams=3)  # input, mamba, attn
+            else:
+                self.fusion_conv = nn.Conv2d(dim * 2, dim, 1)  # 1x1 conv to merge branches
+        else:
+            # Single branch mode - no fusion needed
+            self.mhc = None
+            self.fusion_conv = None
+            
+        # Channel attention
+        if use_ecab:
+            self.cab = ECAB(dim)
+        else:
+            # Standard CAB (SE-Block style) - simplified version
+            self.cab = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(dim, dim // 4, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dim // 4, dim, 1),
+                nn.Sigmoid()
+            )
+        self.use_ecab = use_ecab
         
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         
@@ -118,50 +157,95 @@ class LGSBlock(nn.Module):
         # x: (B, L, C) where L = H*W
         B, L, C = x.shape
         shortcut = x
-        x = self.norm1(x)
+        x_norm = self.norm1(x)
         
-        # --- Branch A: Mamba2 (Global) ---
-        # Mamba2 handles (B, L, C) directly.
-        # TODO: Add 2D-scanning (interleaved or zig-zag) here for better spatial awareness if needed.
-        # For Phase 1 baseline, we treat it as a sequence.
-        x_mamba = self.mamba(x)
+        x_mamba = None
+        x_attn = None
+        
+        # --- Branch A: Mamba2 (Global) with SS2D ---
+        if self.use_mamba:
+            x_view = x_norm.view(B, H, W, C)
+            x_scan = scan_images(x_view)
+            x_mamba_out = self.mamba(x_scan)
+            x_mamba_img = merge_images(x_mamba_out, B, H, W)
+            x_mamba = x_mamba_img.flatten(1, 2)  # (B, L, C)
         
         # --- Branch B: Window Attention (Local) ---
-        x_2d = x.view(B, H, W, C)
-        
-        # Shift Window
-        if self.shift_size > 0:
-            shifted_x = torch.roll(x_2d, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
-        else:
-            shifted_x = x_2d
-
-        # Partition
-        x_windows = window_partition(shifted_x, self.window_size) # (nW*B, window_size, window_size, C)
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C) # (nW*B, window_size*window_size, C)
-        
-        # Attention
-        # TODO: Add mask for shifted window if needed (omitted for brevity in baseline)
-        attn_windows = self.attn(x_windows) 
-        
-        # Reverse Partition
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
-        
-        # Reverse Shift
-        if self.shift_size > 0:
-            x_attn = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-        else:
-            x_attn = shifted_x
+        if self.use_attn:
+            x_2d = x_norm.view(B, H, W, C)
             
-        x_attn = x_attn.view(B, L, C)
+            # Shift Window Mask Computation
+            if self.shift_size > 0:
+                img_mask = torch.zeros((1, H, W, 1), device=x.device)
+                h_slices = (slice(0, -self.window_size),
+                            slice(-self.window_size, -self.shift_size),
+                            slice(-self.shift_size, None))
+                w_slices = (slice(0, -self.window_size),
+                            slice(-self.window_size, -self.shift_size),
+                            slice(-self.shift_size, None))
+                cnt = 0
+                for h in h_slices:
+                    for w in w_slices:
+                        img_mask[:, h, w, :] = cnt
+                        cnt += 1
+
+                mask_windows = window_partition(img_mask, self.window_size)
+                mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+                attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+                attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+                
+                shifted_x = torch.roll(x_2d, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            else:
+                shifted_x = x_2d
+                attn_mask = None
+
+            # Partition
+            x_windows = window_partition(shifted_x, self.window_size)
+            x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+            
+            # Gated Attention with Mask
+            attn_windows = self.attn(x_windows, mask=attn_mask) 
+            
+            # Reverse Partition
+            attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+            shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+            
+            # Reverse Shift
+            if self.shift_size > 0:
+                x_attn = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            else:
+                x_attn = shifted_x
+                
+            x_attn = x_attn.view(B, L, C)
         
-        # --- Fusion ---
-        # Concat along channel: (B, L, 2C) -> Transpose to (B, 2C, H, W) -> 1x1 Conv -> (B, C, H, W) -> (B, L, C)
-        x_cat = torch.cat([x_mamba, x_attn], dim=-1)
-        x_cat = x_cat.transpose(1, 2).view(B, 2*C, H, W)
-        x_fused = self.fusion_conv(x_cat).flatten(2).transpose(1, 2)
+        # --- Fusion / Mixing ---
+        if self.backbone_mode == 'hybrid':
+            if self.use_mhc:
+                x_fused_seq = self.mhc([shortcut, x_mamba, x_attn])
+                x_fused = x_fused_seq.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+            else:
+                x_cat = torch.cat([x_mamba, x_attn], dim=-1)
+                x_cat = x_cat.transpose(1, 2).view(B, 2*C, H, W)
+                x_fused = self.fusion_conv(x_cat)
+        elif self.backbone_mode == 'mamba2_only':
+            x_fused = x_mamba.transpose(1, 2).view(B, C, H, W)
+        else:  # gated_attn_only
+            x_fused = x_attn.transpose(1, 2).view(B, C, H, W)
         
-        x = shortcut + self.drop_path(x_fused)
+        # Apply channel attention
+        if self.use_ecab:
+            x_fused = self.cab(x_fused)
+        else:
+            # Standard CAB (SE-style)
+            se_weight = self.cab(x_fused)
+            x_fused = x_fused * se_weight
+            
+        x_fused = x_fused.flatten(2).transpose(1, 2)  # (B, L, C)
+        
+        if self.use_mhc and self.backbone_mode == 'hybrid':
+            x = x_fused
+        else:
+            x = shortcut + self.drop_path(x_fused)
         
         # FFN
         x = x + self.drop_path(self.mlp(self.norm2(x)))
@@ -171,7 +255,8 @@ class LGSBlock(nn.Module):
 class BasicLayer(nn.Module):
     """ A basic Swin/Mamba layer for one stage """
     def __init__(self, dim, output_dim, depth, num_heads, window_size, mlp_ratio=4., drop=0., 
-                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None):
+                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None,
+                 backbone_mode='hybrid', use_mhc=False, use_ecab=True):
         super().__init__()
         self.dim = dim
         self.blocks = nn.ModuleList([
@@ -180,7 +265,10 @@ class BasicLayer(nn.Module):
                 shift_size=0 if (i % 2 == 0) else window_size // 2,
                 mlp_ratio=mlp_ratio,
                 drop=drop, drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                norm_layer=norm_layer
+                norm_layer=norm_layer,
+                backbone_mode=backbone_mode,
+                use_mhc=use_mhc,
+                use_ecab=use_ecab
             )
             for i in range(depth)
         ])
@@ -201,13 +289,17 @@ class BasicLayer(nn.Module):
 class HybridBackbone(nn.Module):
     """
     Phase 1: Hybrid Backbone Baseline
+    Supports ablation modes: 'hybrid', 'mamba2_only', 'gated_attn_only'
     """
     def __init__(self, embed_dims=[32, 64, 128], depths=[2, 2, 2], num_heads=[2, 4, 8], 
-                 window_sizes=[7, 7, 7], mlp_ratios=[4, 4, 4], drop_rate=0., drop_path_rate=0.1):
+                 window_sizes=[7, 7, 7], mlp_ratios=[4, 4, 4], drop_rate=0., drop_path_rate=0.1,
+                 backbone_mode='hybrid', use_mhc=False, use_ecab=True):
         super().__init__()
         
         self.num_layers = len(depths)
         self.embed_dims = embed_dims
+        self.backbone_mode = backbone_mode
+        
         self.patch_embed = nn.Sequential(
             nn.Conv2d(6, embed_dims[0], kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
@@ -221,7 +313,7 @@ class HybridBackbone(nn.Module):
         for i_layer in range(self.num_layers):
             layer = BasicLayer(
                 dim=embed_dims[i_layer],
-                output_dim=embed_dims[i_layer], # Keep dim same in block, handle scale changes if needed
+                output_dim=embed_dims[i_layer],
                 depth=depths[i_layer],
                 num_heads=num_heads[i_layer],
                 window_size=window_sizes[i_layer],
@@ -229,9 +321,10 @@ class HybridBackbone(nn.Module):
                 drop=drop_rate,
                 drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer+1])],
                 norm_layer=nn.LayerNorm,
-                downsample=None # For Phase 1, we keep resolution or use simple strided convs between stages if needed.
-                # NOTE: For VFI, usually we want multi-scale features.
-                # Let's assume we maintain resolution or have explicit downsampling steps.
+                downsample=None,
+                backbone_mode=backbone_mode,
+                use_mhc=use_mhc,
+                use_ecab=use_ecab
             )
             self.layers.append(layer)
             
@@ -245,11 +338,11 @@ class HybridBackbone(nn.Module):
 
     def forward(self, img0, img1):
         x = torch.cat((img0, img1), 1)
-        x = self.patch_embed(x) # (B, C, H, W)
+        x = self.patch_embed(x)  # (B, C, H, W)
         
         outs = []
         B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2) # (B, L, C)
+        x = x.flatten(2).transpose(1, 2)  # (B, L, C)
         
         for i, layer in enumerate(self.layers):
             x, H, W = layer(x, H, W)
@@ -264,7 +357,8 @@ class HybridBackbone(nn.Module):
                 x = x_down.flatten(2).transpose(1, 2)
                 B = x.shape[0]
 
-        return outs # List of [Scale1, Scale2, Scale3] features
+        return outs  # List of [Scale1, Scale2, Scale3] features
+
 
 def build_backbone(cfg):
     # Map config to arguments
@@ -273,5 +367,8 @@ def build_backbone(cfg):
         depths=cfg['depths'],
         num_heads=cfg['num_heads'],
         window_sizes=cfg['window_sizes'],
-        mlp_ratios=cfg['mlp_ratios']
+        mlp_ratios=cfg['mlp_ratios'],
+        backbone_mode=cfg.get('backbone_mode', 'hybrid'),
+        use_mhc=cfg.get('use_mhc', False),
+        use_ecab=cfg.get('use_ecab', True)
     )

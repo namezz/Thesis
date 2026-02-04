@@ -12,34 +12,38 @@ sys.path.append('.')
 import config as cfg
 from Trainer import Model
 
+# Resolution presets
+RESOLUTION_PRESETS = {
+    '720p': (720, 1280),
+    '1080p': (1080, 1920),
+    '2k': (1080, 2048),
+    '2160p': (2160, 3840),  # 4K
+    '4k': (2160, 3840),
+}
+
 parser = argparse.ArgumentParser()
-parser.add_argument('--model', default='ours_small', type=str)
-parser.add_argument('--H', default=256, type=int)
-parser.add_argument('--W', default=256, type=int)
+parser.add_argument('--model', default='hybrid_v1_baseline', type=str)
+parser.add_argument('--H', default=None, type=int, help='Height (overrides resolution preset)')
+parser.add_argument('--W', default=None, type=int, help='Width (overrides resolution preset)')
+parser.add_argument('--resolution', default='720p', type=str, 
+                    choices=['720p', '1080p', '2k', '2160p', '4k'],
+                    help='Resolution preset')
+parser.add_argument('--warmup', default=50, type=int, help='Warmup iterations')
+parser.add_argument('--iterations', default=100, type=int, help='Test iterations')
 args = parser.parse_args()
-# assert args.model in ['ours', 'ours_small'], 'Model not exists!'
 
 '''==========Model setting=========='''
-TTA = True
+TTA = False
 if args.model == 'ours_small':
-    TTA = False
     cfg.MODEL_CONFIG['LOGNAME'] = 'ours_small'
     cfg.MODEL_CONFIG['MODEL_ARCH'] = cfg.init_model_config(
         F = 16,
         depth = [2, 2, 2, 2, 2]
     )
 elif args.model == 'hybrid_v1_baseline':
-    TTA = False
-    # Use config from config.py directly, or ensure it matches
     cfg.MODEL_CONFIG['LOGNAME'] = 'hybrid_v1_baseline'
-    # MODEL_ARCH is already set in config.py for this default
 else:
-    cfg.MODEL_CONFIG['LOGNAME'] = 'ours'
-
-    cfg.MODEL_CONFIG['MODEL_ARCH'] = cfg.init_model_config(
-        F = 32,
-        depth = [2, 2, 2, 4, 4]
-    )
+    cfg.MODEL_CONFIG['LOGNAME'] = args.model
 
 model = Model(-1)
 model.load_model()
@@ -50,19 +54,41 @@ if torch.cuda.is_available():
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True
 
-H, W = args.H, args.W
+# Determine resolution
+if args.H is not None and args.W is not None:
+    H, W = args.H, args.W
+else:
+    H, W = RESOLUTION_PRESETS[args.resolution]
+
 I0 = torch.rand(1, 3, H, W).cuda()
 I1 = torch.rand(1, 3, H, W).cuda()
 
-print(f'Test model: {model.name}  TTA: {TTA}')
+print(f'=== Inference Time Test ===')
+print(f'Model: {model.name}')
+print(f'Resolution: {args.resolution} ({H}x{W})')
+print(f'TTA: {TTA}')
+print(f'Warmup: {args.warmup} iterations')
+print(f'Test: {args.iterations} iterations')
+print('===========================')
+
 with torch.no_grad():
-    for i in range(50):
+    # Warmup
+    for i in range(args.warmup):
         pred = model.inference(I0, I1)
+    
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+    
+    # Benchmark
     time_stamp = time()
-    for i in range(100):
+    for i in range(args.iterations):
         pred = model.inference(I0, I1)
+    
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    print((time() - time_stamp) / 100 * 1000)
+    
+    avg_time_ms = (time() - time_stamp) / args.iterations * 1000
+    fps = 1000 / avg_time_ms
+    
+    print(f'Average time: {avg_time_ms:.2f} ms')
+    print(f'FPS: {fps:.2f}')

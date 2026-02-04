@@ -52,13 +52,15 @@ class Model:
     @torch.no_grad()
     def inference(self, img0, img1, TTA=False, timestep=0.5, fast_TTA=False):
         # Wrapper for benchmark scripts
-        # TODO: Implement TTA logic if needed
-        return self.net.inference(img0, img1, timestep=timestep)
+        # Returns tuple (pred,) for compatibility
+        pred = self.net.inference(img0, img1, TTA=TTA, timestep=timestep)
+        return (pred,)  # Return as tuple for unpacking in benchmarks
 
     @torch.no_grad()
     def hr_inference(self, img0, img1, TTA=False, down_scale=1.0, timestep=0.5, fast_TTA=False):
-        # Placeholder for high-res inference logic
-        return self.inference(img0, img1, TTA=TTA, timestep=timestep, fast_TTA=fast_TTA)
+        # High-resolution inference with optional downscaling for flow estimation
+        pred = self.net.inference(img0, img1, TTA=TTA, scale=down_scale, timestep=timestep)
+        return (pred,)  # Return as tuple for unpacking in benchmarks
     
     def update(self, imgs, gt, learning_rate=0, training=True):
         for param_group in self.optimG.param_groups:

@@ -36,42 +36,73 @@ class ThesisModel(nn.Module):
             warped_img1 = warp(img1, f1)
             
             # 3. Extract features from warped images (Feature Pre-warping)
-            # Alternatively, extract then warp. Let's start with image-level warping for baseline.
+            # For Phase 2, we should probably feed warped images to backbone
             feats = self.backbone(warped_img0, warped_img1)
             
-            # 4. Refine with warped info
-            # Refine head will need to handle warped images eventually.
-            res = self.refine(feats)
+            # 4. Refine
+            res, mask = self.refine(feats)
             
-            # Simple blending for now
-            mask = 0.5 # Placeholder for learned mask
-            merged = warped_img0 * (1-mask) + warped_img1 * mask
-            return torch.clamp(merged + (res * 2 - 1) * 0.1, 0, 1)
+            # Blending
+            merged = warped_img0 * mask + warped_img1 * (1 - mask)
+            pred = merged + res
+            return torch.clamp(pred, 0, 1)
         else:
-            # Phase 1: Backbone only (Implicit Motion)
+            # Phase 1: Backbone only (Implicit Motion / Direct Regression)
+            # In this phase, we rely on the backbone to find correspondences.
+            # We treat the output as a refinement over a simple blend or direct prediction.
             feats = self.backbone(img0, img1)
-            res = self.refine(feats)
-            return res
+            res, mask = self.refine(feats)
+            
+            # For Phase 1 baseline, simple linear blend as base
+            merged = img0 * (1 - timestep) + img1 * timestep
+            # Or use learned mask to blend original frames (Attention-based averaging)
+            merged = img0 * mask + img1 * (1 - mask)
+            
+            pred = merged + res
+            return torch.clamp(pred, 0, 1)
 
-    def inference(self, img0, img1, timestep=0.5):
-        # Inference wrapper
-        # Ensure input is multiple of window size or pad it?
-        # The Backbone handles arbitrary sizes but Window Attention needs padding usually.
-        # For simplicity in Phase 1, we assume inputs are divisible or handle errors.
-        # Adding simple padding logic here is good practice.
-        
-        B, C, H, W = img0.shape
-        # Pad to multiple of 32 (standard for 5-level models, here 3 levels -> 8 is enough, but 32 is safe)
+    def inference(self, img0, img1, TTA=False, scale=1.0, timestep=0.5, fast_TTA=False):
+        # Scale handling
+        if scale != 1.0:
+            h, w = img0.shape[2], img0.shape[3]
+            # Downsample for processing
+            img0_s = F.interpolate(img0, scale_factor=scale, mode='bilinear', align_corners=False)
+            img1_s = F.interpolate(img1, scale_factor=scale, mode='bilinear', align_corners=False)
+        else:
+            img0_s, img1_s = img0, img1
+
+        # Padding
+        B, C, H, W = img0_s.shape
         pad_h = (32 - H % 32) % 32
         pad_w = (32 - W % 32) % 32
         if pad_h != 0 or pad_w != 0:
-            img0 = F.pad(img0, (0, pad_w, 0, pad_h), mode='reflect')
-            img1 = F.pad(img1, (0, pad_w, 0, pad_h), mode='reflect')
+            img0_s = F.pad(img0_s, (0, pad_w, 0, pad_h), mode='reflect')
+            img1_s = F.pad(img1_s, (0, pad_w, 0, pad_h), mode='reflect')
             
-        x = torch.cat((img0, img1), 1)
-        pred = self.forward(x)
+        def _infer(i0, i1):
+            x = torch.cat((i0, i1), 1)
+            return self.forward(x, timestep)
+
+        if TTA:
+            # Test Time Augmentation: Average of forward and flipped
+            pred = _infer(img0_s, img1_s)
+            
+            # Flip inputs: Horizontal, Vertical, or Rotation?
+            # Standard VFI TTA: Horizontal flip and Swap (if t=0.5)
+            # RIFE/EMA-VFI use Horizontal Flip
+            img0_flip = img0_s.flip(3)
+            img1_flip = img1_s.flip(3)
+            pred_flip = _infer(img0_flip, img1_flip)
+            pred = (pred + pred_flip.flip(3)) / 2
+        else:
+            pred = _infer(img0_s, img1_s)
         
+        # Unpad
         if pad_h != 0 or pad_w != 0:
             pred = pred[:, :, :H, :W]
+            
+        # Upsample back if scaled
+        if scale != 1.0:
+            pred = F.interpolate(pred, size=(img0.shape[2], img0.shape[3]), mode='bilinear', align_corners=False)
             
         return pred

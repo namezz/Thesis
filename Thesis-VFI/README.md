@@ -12,11 +12,15 @@ Existing SSM-based VFI methods (VFIMamba, LC-Mamba) rely on Mamba1's S6 scan and
 
 1. **Upgrades to Mamba2 (SSD)**: 2-8x faster training, state dim 64/128 (vs 16), tensor core acceleration.
 2. **Integrates Gated Attention**: NeurIPS 2025 Best Paper technique -- sigmoid gate after SDPA output eliminates attention sink and improves stability.
-3. **Hybrid Design**: Inspired by MambaVision (CVPR 2025) and MaTVLM (ICCV 2025).
+3. **SS2D & ECAB**: 
+    - Implements **4-direction SS2D Scanning** for Mamba2 to handle 2D spatial context.
+    - Replaces standard CAB with **ECAB (Efficient Channel Attention)** for better channel-wise feature refinement.
+4. **mHC (Manifold-Constrained Hyper-Connections)**: Stabilizes residual mixing of Mamba and Attention streams using Birkhoff Polytope projection (DeepSeek, 2025).
+5. **MaTVLM Initialization**: Leverages attention weights to initialize Mamba2 layers for faster convergence.
 
 ```
-                     +--- Mamba2 Branch (Global, O(n)) --------+
-Input Features ------+                                          +-- Fusion (1x1 Conv) -- CAB -- Output
+                     +--- Mamba2 Branch (Global, O(n)) + SS2D -+
+Input Features ------+                                          +-- mHC / Fusion -- ECAB -- Output
                      +--- Gated Window Attn Branch (Local) ----+
 ```
 
@@ -24,12 +28,12 @@ Input Features ------+                                          +-- Fusion (1x1 
 
 ### Phase 1: Hybrid Backbone Baseline (Current)
 - **Goal**: Validate Mamba2 + Gated Window Attention hybrid on Vimeo90K
-- **Key Module**: LGS Block (Mamba2 SSD + Gated Window Attn + CAB)
+- **Key Module**: LGS Block (Mamba2 SSD + SS2D + Gated Window Attn + ECAB + mHC)
 - **Target**: Vimeo90K PSNR >= 36.0 dB
 
 ### Phase 2: Motion-Aware Guidance
 - **Goal**: Solve large motion via explicit optical flow
-- **Key Module**: IFNet-style flow estimator + feature pre-warping
+- **Key Module**: IFNet-style flow estimator + feature pre-warping + U-Net Refinement
 - **Target**: SNU-FILM Extreme >= +1.0 dB over Phase 1
 
 ### Phase 3: High-Fidelity Synthesis (X4K)
@@ -56,11 +60,12 @@ Thesis-VFI/
 +-- demo_2x.py                # 2x interpolation demo
 |
 +-- model/                     # Core model architecture
-|   +-- __init__.py            # ThesisModel integration logic
+|   +-- __init__.py            # ThesisModel integration logic (Phase 1 & 2)
 |   +-- backbone.py            # LGS Block: Mamba2 + Gated Window Attn
 |   +-- flow.py                # Optical flow estimation (Phase 2)
-|   +-- refine.py              # Feature refinement & image reconstruction
+|   +-- refine.py              # U-Net based fusion & refinement
 |   +-- warplayer.py           # Differentiable backward warping
+|   +-- utils.py               # ECAB, SS2D scan/merge utilities
 |
 +-- benchmark/                 # Evaluation scripts
 |   +-- Vimeo90K.py
@@ -85,8 +90,8 @@ python unit_test_train.py --data_path /path/to/vimeo_septuplet
 
 ### Training
 ```bash
-# Distributed training on 4 GPUs
-python -m torch.distributed.launch --nproc_per_node=4 train.py --world_size 4 --batch_size 8 --data_path /path/to/vimeo90k
+# Single GPU training on V100 16GB
+python train.py --world_size 1 --batch_size 8 --data_path /path/to/vimeo90k
 ```
 
 ### Visualization
@@ -148,4 +153,4 @@ python demo_2x.py --model thesis_v1 --video input.mp4 --scale 1.0
 
 ---
 
-*Last updated: 2026-02-02 (v4.0 -- Mamba2 + Gated Attention)*
+*Last updated: 2026-02-04 (v4.1 -- SS2D, ECAB, RIFE Refinement)*

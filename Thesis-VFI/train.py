@@ -13,7 +13,7 @@ from dataset import VimeoDataset, X4KDataset, MixedDataset
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data.distributed import DistributedSampler
-from config import *
+from config import MODEL_CONFIG, PHASE1_CONFIG, PHASE2_CONFIG, PHASE3_CONFIG, ABLATION_CONFIGS, init_model_config
 
 device = torch.device("cuda")
 
@@ -106,6 +106,23 @@ if __name__ == "__main__":
     parser.add_argument('--data_path', type=str, required=True, help='data path of vimeo90k')
     parser.add_argument('--x4k_path', type=str, default=None, help='data path of x4k1000fps')
     parser.add_argument('--mixed_ratio', type=str, default="2:1", help='Mixed ratio Vimeo:X4K (e.g. 2:1)')
+    # Phase control
+    parser.add_argument('--phase', type=int, default=1, choices=[1, 2, 3], help='Training phase (1/2/3)')
+    # Ablation experiment control
+    parser.add_argument('--exp_name', type=str, default=None, help='Experiment name (overrides phase config)')
+    parser.add_argument('--backbone_mode', type=str, default='hybrid', 
+                        choices=['hybrid', 'mamba2_only', 'gated_attn_only'],
+                        help='Backbone mode for ablation')
+    parser.add_argument('--use_mhc', action='store_true', help='Use Manifold Hyper-Connections')
+    parser.add_argument('--use_ecab', action='store_true', default=True, help='Use ECAB (default: True)')
+    # Training control
+    parser.add_argument('--epochs', type=int, default=300, help='Number of epochs')
+    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
+    parser.add_argument('--freeze_backbone', type=int, default=0, help='Freeze backbone for N epochs (Phase 2)')
+    parser.add_argument('--dry_run', action='store_true', help='Quick sanity check (1 epoch)')
+    # Curriculum learning (Phase 3)
+    parser.add_argument('--curriculum', action='store_true', help='Enable curriculum learning')
+    parser.add_argument('--curriculum_T', type=int, default=50, help='Curriculum transition epoch')
     args = parser.parse_args()
     
     if 'LOCAL_RANK' in os.environ:
@@ -115,11 +132,51 @@ if __name__ == "__main__":
     
     v_w, x_w = map(int, args.mixed_ratio.split(':'))
     
+    # =============================================================================
+    # Configure MODEL_CONFIG based on phase and arguments
+    # =============================================================================
+    if args.phase == 1:
+        base_config = PHASE1_CONFIG.copy()
+    elif args.phase == 2:
+        base_config = PHASE2_CONFIG.copy()
+    elif args.phase == 3:
+        base_config = PHASE3_CONFIG.copy()
+    else:
+        base_config = MODEL_CONFIG.copy()
+    
+    # Override with ablation config if exp_name matches
+    if args.exp_name and args.exp_name in ABLATION_CONFIGS:
+        base_config['MODEL_ARCH'] = ABLATION_CONFIGS[args.exp_name]
+        base_config['LOGNAME'] = args.exp_name
+    elif args.exp_name:
+        # Custom experiment name
+        base_config['LOGNAME'] = args.exp_name
+        base_config['MODEL_ARCH'] = init_model_config(
+            F=32, W=8, depth=[2,2,2],
+            backbone_mode=args.backbone_mode,
+            use_mhc=args.use_mhc,
+            use_ecab=args.use_ecab
+        )
+    
+    # Update global MODEL_CONFIG
+    MODEL_CONFIG.update(base_config)
+    
+    if local_rank == 0:
+        print(f"=== Training Configuration ===")
+        print(f"Phase: {args.phase}")
+        print(f"Experiment: {MODEL_CONFIG['LOGNAME']}")
+        print(f"Backbone Mode: {MODEL_CONFIG['MODEL_ARCH'].get('backbone_mode', 'hybrid')}")
+        print(f"USE_FLOW: {MODEL_CONFIG['USE_FLOW']}")
+        print(f"USE_X4K_TRAINING: {MODEL_CONFIG['USE_X4K_TRAINING']}")
+        print(f"==============================")
+    
     dist.init_process_group(backend="nccl", world_size=args.world_size, rank=local_rank)
     torch.cuda.set_device(local_rank)
     
     if local_rank == 0 and not os.path.exists('log'):
         os.mkdir('log')
+    if local_rank == 0 and not os.path.exists('ckpt'):
+        os.mkdir('ckpt')
         
     seed = 1234
     random.seed(seed)
@@ -129,4 +186,14 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
     
     model = Model(local_rank)
+    
+    # Resume from checkpoint if specified
+    if args.resume:
+        if local_rank == 0:
+            print(f"Resuming from {args.resume}")
+        model.load_model(name=args.resume.replace('.pkl', '').replace('ckpt/', ''))
+    
+    # Dry run mode
+    epochs = 1 if args.dry_run else args.epochs
+    
     train(model, local_rank, args.batch_size, args.data_path, args.x4k_path, mixed_ratio=(v_w, x_w))
