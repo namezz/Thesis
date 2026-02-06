@@ -27,11 +27,15 @@ def get_learning_rate(step, step_per_epoch):
 
 from tqdm import tqdm
 
-def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(2, 1)):
+def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(2, 1), freeze_epochs=0, total_epochs=300):
     if local_rank == 0:
         writer = SummaryWriter(f'log/train_{MODEL_CONFIG["LOGNAME"]}')
     step = 0
     nr_eval = 0
+    
+    # Freeze backbone if requested
+    if freeze_epochs > 0:
+        model.freeze_backbone()
     
     vimeo_train = VimeoDataset('train', data_path)
     if MODEL_CONFIG.get('USE_X4K_TRAINING', False) and x4k_path:
@@ -50,7 +54,13 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
     
     if local_rank == 0: print(f'Training with {MODEL_CONFIG["LOGNAME"]}...')
     time_stamp = time.time()
-    for epoch in range(300):
+    for epoch in range(total_epochs):
+        # Unfreeze backbone after freeze_epochs
+        if freeze_epochs > 0 and epoch == freeze_epochs:
+            model.unfreeze_backbone()
+            if local_rank == 0:
+                print(f"Epoch {epoch}: Backbone unfrozen")
+        
         sampler.set_epoch(epoch)
         # Use tqdm for progress bar
         pbar = tqdm(train_data, desc=f"Epoch {epoch}", disable=(local_rank != 0))
@@ -146,17 +156,19 @@ if __name__ == "__main__":
     
     # Override with ablation config if exp_name matches
     if args.exp_name and args.exp_name in ABLATION_CONFIGS:
-        base_config['MODEL_ARCH'] = ABLATION_CONFIGS[args.exp_name]
+        ablation_arch = ABLATION_CONFIGS[args.exp_name].copy()
+        ablation_arch['use_flow'] = base_config.get('USE_FLOW', False)
+        base_config['MODEL_ARCH'] = ablation_arch
         base_config['LOGNAME'] = args.exp_name
     elif args.exp_name:
         # Custom experiment name
         base_config['LOGNAME'] = args.exp_name
-        base_config['MODEL_ARCH'] = init_model_config(
+        base_config['MODEL_ARCH'] = {**init_model_config(
             F=32, W=8, depth=[2,2,2],
             backbone_mode=args.backbone_mode,
             use_mhc=args.use_mhc,
             use_ecab=args.use_ecab
-        )
+        ), 'use_flow': base_config.get('USE_FLOW', False)}
     
     # Update global MODEL_CONFIG
     MODEL_CONFIG.update(base_config)
@@ -193,7 +205,13 @@ if __name__ == "__main__":
             print(f"Resuming from {args.resume}")
         model.load_model(name=args.resume.replace('.pkl', '').replace('ckpt/', ''))
     
+    # Freeze backbone if specified (Phase 2 fine-tuning)
+    freeze_epochs = args.freeze_backbone
+    if freeze_epochs > 0 and local_rank == 0:
+        print(f"Will freeze backbone for first {freeze_epochs} epochs")
+    
     # Dry run mode
     epochs = 1 if args.dry_run else args.epochs
     
-    train(model, local_rank, args.batch_size, args.data_path, args.x4k_path, mixed_ratio=(v_w, x_w))
+    train(model, local_rank, args.batch_size, args.data_path, args.x4k_path, 
+          mixed_ratio=(v_w, x_w), freeze_epochs=freeze_epochs, total_epochs=epochs)

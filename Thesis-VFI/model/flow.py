@@ -67,8 +67,9 @@ class OpticalFlowEstimator(nn.Module):
         x = torch.cat((img0, img1, warped_img0, warped_img1, mask1), 1)
         flow2, mask2 = self.block2(x, flow1, scale=1)
         flow2 = flow1 + flow2
+        mask2 = mask1 + mask2
         
-        return flow2
+        return flow2, mask2
 
 def build_flow_estimator():
     return OpticalFlowEstimator()

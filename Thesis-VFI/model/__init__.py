@@ -2,7 +2,6 @@ from .backbone import build_backbone
 from .flow import build_flow_estimator
 from .refine import RefineNet
 from .warplayer import warp
-from config import MODEL_CONFIG
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
@@ -12,7 +11,7 @@ class ThesisModel(nn.Module):
         super(ThesisModel, self).__init__()
         self.backbone = build_backbone(cfg)
         
-        self.use_flow = MODEL_CONFIG.get('USE_FLOW', False)
+        self.use_flow = cfg.get('use_flow', False)
         if self.use_flow:
             self.flow_estimator = build_flow_estimator()
         
@@ -25,39 +24,29 @@ class ThesisModel(nn.Module):
         
         if self.use_flow:
             # Phase 2: Flow Guidance
-            # 1. Estimate flow
-            flow = self.flow_estimator(img0, img1) # (B, 4, H, W) for bidirectional flow
+            flow, flow_mask = self.flow_estimator(img0, img1)
             
-            # 2. Warp inputs to intermediate time t
             f0 = flow[:, :2] * timestep
             f1 = flow[:, 2:4] * (1 - timestep)
             
             warped_img0 = warp(img0, f0)
             warped_img1 = warp(img1, f1)
             
-            # 3. Extract features from warped images (Feature Pre-warping)
-            # For Phase 2, we should probably feed warped images to backbone
             feats = self.backbone(warped_img0, warped_img1)
+            res, refine_mask = self.refine(feats)
             
-            # 4. Refine
-            res, mask = self.refine(feats)
-            
-            # Blending
+            # Combine flow mask and refine mask
+            mask = torch.sigmoid(flow_mask + refine_mask)
             merged = warped_img0 * mask + warped_img1 * (1 - mask)
             pred = merged + res
             return torch.clamp(pred, 0, 1)
         else:
-            # Phase 1: Backbone only (Implicit Motion / Direct Regression)
-            # In this phase, we rely on the backbone to find correspondences.
-            # We treat the output as a refinement over a simple blend or direct prediction.
+            # Phase 1: Backbone only (Direct Regression)
             feats = self.backbone(img0, img1)
             res, mask = self.refine(feats)
             
-            # For Phase 1 baseline, simple linear blend as base
-            merged = img0 * (1 - timestep) + img1 * timestep
-            # Or use learned mask to blend original frames (Attention-based averaging)
+            # Learned mask blending of original frames + residual refinement
             merged = img0 * mask + img1 * (1 - mask)
-            
             pred = merged + res
             return torch.clamp(pred, 0, 1)
 

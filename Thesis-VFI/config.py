@@ -34,21 +34,21 @@ def init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid', use_mh
 
 PHASE1_CONFIG = {
     'LOGNAME': 'phase1_hybrid',
-    'MODEL_ARCH': init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'),
+    'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'), 'use_flow': False},
     'USE_FLOW': False,
     'USE_X4K_TRAINING': False,
 }
 
 PHASE2_CONFIG = {
     'LOGNAME': 'phase2_flow',
-    'MODEL_ARCH': init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'),
+    'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'), 'use_flow': True},
     'USE_FLOW': True,
     'USE_X4K_TRAINING': False,
 }
 
 PHASE3_CONFIG = {
     'LOGNAME': 'phase3_4k',
-    'MODEL_ARCH': init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'),
+    'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'), 'use_flow': True},
     'USE_FLOW': True,
     'USE_X4K_TRAINING': True,
 }
@@ -80,11 +80,11 @@ ABLATION_CONFIGS = {
 # Default active config (can be overridden by train.py args)
 MODEL_CONFIG = {
     'LOGNAME': 'hybrid_v1_baseline',
-    'MODEL_ARCH': init_model_config(
+    'MODEL_ARCH': {**init_model_config(
         F = 32,
         W = 8,
-        depth = [2, 2, 2]  # Lightweight baseline
-    ),
+        depth = [2, 2, 2]
+    ), 'use_flow': False},
     'USE_FLOW': False,
     'USE_X4K_TRAINING': False
 }

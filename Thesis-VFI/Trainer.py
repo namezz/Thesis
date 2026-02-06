@@ -19,6 +19,9 @@ class Model:
         self.lap_loss = LapLoss()
         self.vgg_loss = VGGPerceptualLoss()
         
+        # AMP
+        self.scaler = torch.amp.GradScaler('cuda')
+        
         if local_rank != -1:
             # find_unused_parameters=True is needed for conditional architecture (ablation modes)
             self.net = DDP(self.net, device_ids=[local_rank], output_device=local_rank, 
@@ -43,13 +46,24 @@ class Model:
             path = f'ckpt/{name}.pkl'
             if os.path.exists(path):
                 print(f"Loading model from {path}")
-                self.net.load_state_dict(torch.load(path), strict=False)
+                state_dict = torch.load(path, map_location='cpu', weights_only=True)
+                # Handle DDP 'module.' prefix mismatch
+                model_dict = self.net.state_dict()
+                has_module = any(k.startswith('module.') for k in model_dict.keys())
+                ckpt_has_module = any(k.startswith('module.') for k in state_dict.keys())
+                if has_module and not ckpt_has_module:
+                    state_dict = {f'module.{k}': v for k, v in state_dict.items()}
+                elif not has_module and ckpt_has_module:
+                    state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
+                self.net.load_state_dict(state_dict, strict=False)
             else:
                 print(f"No checkpoint found at {path}, starting from scratch.")
     
     def save_model(self, rank=0):
         if rank == 0:
-            torch.save(self.net.state_dict(), f'ckpt/{self.name}.pkl')
+            # Save without 'module.' prefix for portability
+            state_dict = self.net.module.state_dict() if hasattr(self.net, 'module') else self.net.state_dict()
+            torch.save(state_dict, f'ckpt/{self.name}.pkl')
 
     @torch.no_grad()
     def inference(self, img0, img1, TTA=False, timestep=0.5, fast_TTA=False):
@@ -68,26 +82,42 @@ class Model:
         """
         pred = self.net.inference(img0, img1, TTA=TTA, scale=down_scale, timestep=timestep, fast_TTA=fast_TTA)
         return (pred,)
-        return (pred,)  # Return as tuple for unpacking in benchmarks
+    
+    def freeze_backbone(self):
+        """Freeze backbone parameters for Phase 2 fine-tuning."""
+        backbone = self.net.module.backbone if hasattr(self.net, 'module') else self.net.backbone
+        for param in backbone.parameters():
+            param.requires_grad = False
+        print("Backbone parameters frozen.")
+    
+    def unfreeze_backbone(self):
+        """Unfreeze backbone parameters."""
+        backbone = self.net.module.backbone if hasattr(self.net, 'module') else self.net.backbone
+        for param in backbone.parameters():
+            param.requires_grad = True
+        print("Backbone parameters unfrozen.")
     
     def update(self, imgs, gt, learning_rate=0, training=True):
         for param_group in self.optimG.param_groups:
             param_group['lr'] = learning_rate
         if training:
             self.train()
-            pred = self.net(imgs)
+            x = torch.cat(imgs, dim=1) if isinstance(imgs, list) else imgs
             
-            # Hybrid Loss
-            loss_lap = self.lap_loss(pred, gt)
-            loss_vgg = self.vgg_loss(pred, gt)
-            loss_total = loss_lap + 0.01 * loss_vgg
+            with torch.amp.autocast('cuda'):
+                pred = self.net(x)
+                loss_lap = self.lap_loss(pred, gt)
+                loss_vgg = self.vgg_loss(pred, gt)
+                loss_total = loss_lap + 0.01 * loss_vgg
             
             self.optimG.zero_grad()
-            loss_total.backward()
-            self.optimG.step()
+            self.scaler.scale(loss_total).backward()
+            self.scaler.step(self.optimG)
+            self.scaler.update()
             return pred, loss_total
         else: 
             self.eval()
             with torch.no_grad():
-                pred = self.net(imgs)
+                x = torch.cat(imgs, dim=1) if isinstance(imgs, list) else imgs
+                pred = self.net(x)
                 return pred, 0

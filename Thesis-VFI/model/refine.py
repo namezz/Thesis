@@ -37,17 +37,7 @@ class RefineNet(nn.Module):
         # Backbone provides features at 3 scales:
         # F0 (H, W, c), F1 (H/2, W/2, 2c), F2 (H/4, W/4, 4c)
         
-        # Downsample path (Encoder) - Processing concatenated inputs if needed, 
-        # but here we primarily fuse backbone features.
-        
         # Upsample path (Decoder)
-        # We start from the coarsest feature F2 (4c)
-        
-        self.up0 = deconv(4*c, 2*c) # H/4 -> H/2
-        self.up1 = deconv(4*c, c)   # (2c from up0 + 2c from F1) -> H
-        self.up2 = deconv(2*c, c)   # (c from up1 + c from F0) -> 2H (if we wanted super-res, but here we stay at H)
-        
-        # Since output is H,W, let's adjust.
         # F2(H/4) -> up -> H/2. Cat F1(H/2).
         # H/2 -> up -> H. Cat F0(H).
         

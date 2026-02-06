@@ -9,12 +9,12 @@ except ImportError:
     print("Warning: Mamba2 not found. Using placeholder or falling back.")
     Mamba2 = None # Handle gracefully or ensure env is correct
 
-from .utils import window_partition, window_reverse, Mlp, ECAB, scan_images, merge_images, ManifoldResConnection
+from .utils import window_partition, window_reverse, Mlp, ECAB, scan_images, merge_images, interleaved_scan, interleaved_merge, ManifoldResConnection, matvlm_init_mamba2
 
 class GatedWindowAttention(nn.Module):
     """
     Window based multi-head self-attention (W-MSA) with gating mechanism.
-    Ref: Gated Attention (NeurIPS 2025)
+    Ref: Gated Attention (arXiv:2505.06708, Qiu et al., Qwen Team, 2025)
     Uses FlashAttention-2 via F.scaled_dot_product_attention.
     """
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
@@ -154,25 +154,34 @@ class LGSBlock(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def forward(self, x, H, W):
-        # x: (B, L, C) where L = H*W
-        B, L, C = x.shape
+        """
+        Args:
+            x: (2B, L, C) where first B are frame0, last B are frame1 features
+               (batch-concatenated as in VFIMamba)
+        """
+        twoB, L, C = x.shape
+        B = twoB // 2
         shortcut = x
         x_norm = self.norm1(x)
         
         x_mamba = None
         x_attn = None
         
-        # --- Branch A: Mamba2 (Global) with SS2D ---
+        # --- Branch A: Mamba2 (Global) with VFIMamba-style Interleaved SS2D ---
+        # Interleaves tokens from frame0 and frame1 into one sequence,
+        # enabling cross-frame temporal interaction within the SSM's recurrent state.
         if self.use_mamba:
-            x_view = x_norm.view(B, H, W, C)
-            x_scan = scan_images(x_view)
-            x_mamba_out = self.mamba(x_scan)
-            x_mamba_img = merge_images(x_mamba_out, B, H, W)
-            x_mamba = x_mamba_img.flatten(1, 2)  # (B, L, C)
+            with torch.amp.autocast('cuda', enabled=False):
+                x_view = x_norm.float().view(twoB, H, W, C)  # (2B, H, W, C)
+                x_scan = interleaved_scan(x_view)      # (4B, 2*H*W, C)
+                x_mamba_out = self.mamba(x_scan)        # (4B, 2*H*W, C)
+                x_mamba_img = interleaved_merge(x_mamba_out, B, H, W)  # (2B, H, W, C)
+                x_mamba = x_mamba_img.flatten(1, 2).to(x_norm.dtype)   # (2B, L, C)
         
         # --- Branch B: Window Attention (Local) ---
+        # Operates per-frame independently (2B batch)
         if self.use_attn:
-            x_2d = x_norm.view(B, H, W, C)
+            x_2d = x_norm.view(twoB, H, W, C)
             
             # Shift Window Mask Computation
             if self.shift_size > 0:
@@ -216,21 +225,21 @@ class LGSBlock(nn.Module):
             else:
                 x_attn = shifted_x
                 
-            x_attn = x_attn.view(B, L, C)
+            x_attn = x_attn.view(twoB, L, C)
         
         # --- Fusion / Mixing ---
         if self.backbone_mode == 'hybrid':
             if self.use_mhc:
                 x_fused_seq = self.mhc([shortcut, x_mamba, x_attn])
-                x_fused = x_fused_seq.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+                x_fused = x_fused_seq.view(twoB, H, W, C).permute(0, 3, 1, 2).contiguous()
             else:
                 x_cat = torch.cat([x_mamba, x_attn], dim=-1)
-                x_cat = x_cat.transpose(1, 2).view(B, 2*C, H, W)
+                x_cat = x_cat.transpose(1, 2).view(twoB, 2*C, H, W)
                 x_fused = self.fusion_conv(x_cat)
         elif self.backbone_mode == 'mamba2_only':
-            x_fused = x_mamba.transpose(1, 2).view(B, C, H, W)
+            x_fused = x_mamba.transpose(1, 2).view(twoB, C, H, W)
         else:  # gated_attn_only
-            x_fused = x_attn.transpose(1, 2).view(B, C, H, W)
+            x_fused = x_attn.transpose(1, 2).view(twoB, C, H, W)
         
         # Apply channel attention
         if self.use_ecab:
@@ -301,7 +310,7 @@ class HybridBackbone(nn.Module):
         self.backbone_mode = backbone_mode
         
         self.patch_embed = nn.Sequential(
-            nn.Conv2d(6, embed_dims[0], kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(3, embed_dims[0], kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(embed_dims[0], embed_dims[0], kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.1, inplace=True)
@@ -337,27 +346,54 @@ class HybridBackbone(nn.Module):
              ))
 
     def forward(self, img0, img1):
-        x = torch.cat((img0, img1), 1)
-        x = self.patch_embed(x)  # (B, C, H, W)
+        """
+        VFIMamba-style batch processing: concatenate frames along batch dim
+        so the Mamba branch can perform interleaved cross-frame scanning.
+        
+        Input: img0, img1: (B, 3, H, W)
+        Output: list of multi-scale features, each (B, C_i, H_i, W_i)
+        """
+        B_orig = img0.shape[0]
+        # Batch-concat: (2B, 3, H, W) — frame0 in first half, frame1 in second half
+        x = torch.cat([img0, img1], dim=0)  # (2B, 3, H, W)
+        x = self.patch_embed(x)  # (2B, C, H, W)
         
         outs = []
-        B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)  # (B, L, C)
+        twoB, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)  # (2B, L, C)
         
         for i, layer in enumerate(self.layers):
             x, H, W = layer(x, H, W)
-            # Output features of this stage
-            x_out = x.transpose(1, 2).view(B, -1, H, W)
-            outs.append(x_out)
+            # Output features: (2B, C, H, W) -> sum frame0 and frame1 features -> (B, C, H, W)
+            x_out = x.transpose(1, 2).view(twoB, -1, H, W)
+            # Merge the two frames' features by summation (cross-frame info already mixed by Mamba)
+            x_out_merged = x_out[:B_orig] + x_out[B_orig:]  # (B, C, H, W)
+            outs.append(x_out_merged)
             
             if i < self.num_layers - 1:
-                # Downsample for next stage
+                # Downsample for next stage — keep 2B batch structure
                 x_down = self.downsamplers[i](x_out)
                 _, _, H, W = x_down.shape
                 x = x_down.flatten(2).transpose(1, 2)
-                B = x.shape[0]
 
         return outs  # List of [Scale1, Scale2, Scale3] features
+
+    def init_mamba_from_attn(self):
+        """
+        MaTVLM-style initialization: transfer Attention Q/K/V weights to Mamba2 B/C/x
+        for each LGSBlock that has both branches (hybrid mode).
+        Call this AFTER model construction, BEFORE training.
+        """
+        if self.backbone_mode != 'hybrid':
+            print("init_mamba_from_attn: skipped (not hybrid mode)")
+            return
+        count = 0
+        for layer in self.layers:
+            for blk in layer.blocks:
+                if blk.use_mamba and blk.use_attn and hasattr(blk.mamba, 'in_proj'):
+                    matvlm_init_mamba2(blk.mamba, blk.attn)
+                    count += 1
+        print(f"MaTVLM init: transferred weights for {count} LGS blocks")
 
 
 def build_backbone(cfg):

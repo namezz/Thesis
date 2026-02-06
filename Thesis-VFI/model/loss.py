@@ -3,9 +3,7 @@ import torch.nn as nn
 import numpy as np 
 import torch.nn.functional as F
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-def gauss_kernel(channels=3):
+def gauss_kernel(channels=3, device=None):
     kernel = torch.tensor([[1., 4., 6., 4., 1],
                            [4., 16., 24., 16., 4.],
                            [6., 24., 36., 24., 6.],
@@ -13,20 +11,21 @@ def gauss_kernel(channels=3):
                            [1., 4., 6., 4., 1.]])
     kernel /= 256.
     kernel = kernel.repeat(channels, 1, 1, 1)
-    kernel = kernel.to(device)
+    if device is not None:
+        kernel = kernel.to(device)
     return kernel
 
 def downsample(x):
     return x[:, :, ::2, ::2]
 
 def upsample(x):
-    cc = torch.cat([x, torch.zeros(x.shape[0], x.shape[1], x.shape[2], x.shape[3]).to(device)], dim=3)
+    cc = torch.cat([x, torch.zeros_like(x)], dim=3)
     cc = cc.view(x.shape[0], x.shape[1], x.shape[2]*2, x.shape[3])
     cc = cc.permute(0,1,3,2)
-    cc = torch.cat([cc, torch.zeros(x.shape[0], x.shape[1], x.shape[3], x.shape[2]*2).to(device)], dim=3)
+    cc = torch.cat([cc, torch.zeros(x.shape[0], x.shape[1], x.shape[3], x.shape[2]*2, device=x.device)], dim=3)
     cc = cc.view(x.shape[0], x.shape[1], x.shape[3]*2, x.shape[2]*2)
     x_up = cc.permute(0,1,3,2)
-    return conv_gauss(x_up, 4*gauss_kernel(channels=x.shape[1]))
+    return conv_gauss(x_up, 4*gauss_kernel(channels=x.shape[1], device=x.device))
 
 def conv_gauss(img, kernel):
     img = torch.nn.functional.pad(img, (2, 2, 2, 2), mode='reflect')
@@ -40,7 +39,9 @@ def laplacian_pyramid(img, kernel, max_levels=3):
         filtered = conv_gauss(current, kernel)
         down = downsample(filtered)
         up = upsample(down)
-        diff = current-up
+        if up.shape != current.shape:
+            up = F.interpolate(up, size=current.shape[-2:], mode='bilinear', align_corners=False)
+        diff = current - up
         pyr.append(diff)
         current = down
     return pyr
@@ -51,7 +52,8 @@ class VGGPerceptualLoss(nn.Module):
         import ssl
         ssl._create_default_https_context = ssl._create_unverified_context
         from torchvision import models
-        vgg = models.vgg19(pretrained=True).features
+        from torchvision.models import VGG19_Weights
+        vgg = models.vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features
         self.slice1 = nn.Sequential(*[vgg[x] for x in range(9)]) # relu2_2
         self.slice2 = nn.Sequential(*[vgg[x] for x in range(9, 18)]) # relu3_3
         self.slice3 = nn.Sequential(*[vgg[x] for x in range(18, 27)]) # relu4_3
@@ -87,11 +89,12 @@ class LapLoss(torch.nn.Module):
     def __init__(self, max_levels=5, channels=3):
         super(LapLoss, self).__init__()
         self.max_levels = max_levels
-        self.gauss_kernel = gauss_kernel(channels=channels)
+        self.channels = channels
         
     def forward(self, input, target):
-        pyr_input  = laplacian_pyramid(img=input, kernel=self.gauss_kernel, max_levels=self.max_levels)
-        pyr_target = laplacian_pyramid(img=target, kernel=self.gauss_kernel, max_levels=self.max_levels)
+        kernel = gauss_kernel(channels=self.channels, device=input.device)
+        pyr_input  = laplacian_pyramid(img=input, kernel=kernel, max_levels=self.max_levels)
+        pyr_target = laplacian_pyramid(img=target, kernel=kernel, max_levels=self.max_levels)
         return sum(torch.nn.functional.l1_loss(a, b) for a, b in zip(pyr_input, pyr_target))
 
 class Ternary(nn.Module):
@@ -130,3 +133,14 @@ class Ternary(nn.Module):
         img0 = self.transform(self.rgb2gray(img0))
         img1 = self.transform(self.rgb2gray(img1))
         return self.hamming(img0, img1) * self.valid_mask(img0, 1)
+
+
+class CharbonnierLoss(nn.Module):
+    """Charbonnier Loss (L1 variant, more robust than L1 near zero)"""
+    def __init__(self, eps=1e-6):
+        super(CharbonnierLoss, self).__init__()
+        self.eps = eps
+
+    def forward(self, pred, target):
+        diff = pred - target
+        return torch.mean(torch.sqrt(diff * diff + self.eps))

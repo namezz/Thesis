@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+Thesis-VFI/ckpt/
+Thesis-VFI/log/
+*.pkl
+.DS_Store
