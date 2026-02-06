@@ -6,8 +6,10 @@ from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 try:
     from mamba_ssm import Mamba2
 except ImportError:
-    print("Warning: Mamba2 not found. Using placeholder or falling back.")
-    Mamba2 = None # Handle gracefully or ensure env is correct
+    import warnings
+    warnings.warn("mamba_ssm not found. Mamba2 backbone mode will fail at runtime. "
+                  "Install with: pip install mamba-ssm>=2.0")
+    Mamba2 = None
 
 from .utils import window_partition, window_reverse, Mlp, ECAB, scan_images, merge_images, interleaved_scan, interleaved_merge, ManifoldResConnection, matvlm_init_mamba2
 
@@ -107,8 +109,13 @@ class LGSBlock(nn.Module):
                 d_conv=mamba_d_conv,
                 expand=mamba_expand
             )
+        elif self.use_mamba and Mamba2 is None:
+            raise ImportError(
+                "Mamba2 is required for backbone_mode='hybrid' or 'mamba2_only' "
+                "but mamba_ssm is not installed. Install with: pip install mamba-ssm>=2.0"
+            )
         else:
-            self.mamba = nn.Identity() if self.use_mamba else None
+            self.mamba = None
 
         # Branch B: Gated Window Attention (only if hybrid or gated_attn_only)
         self.use_attn = backbone_mode in ['hybrid', 'gated_attn_only']

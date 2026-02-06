@@ -83,13 +83,6 @@ class VGGPerceptualLoss(nn.Module):
         self.register_buffer('std', torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def forward(self, input, target):
-        if input.device != self.mean.device:
-            self.mean = self.mean.to(input.device)
-            self.std = self.std.to(input.device)
-            self.slice1 = self.slice1.to(input.device)
-            self.slice2 = self.slice2.to(input.device)
-            self.slice3 = self.slice3.to(input.device)
-            
         input = (input - self.mean) / self.std
         target = (target - self.mean) / self.std
         

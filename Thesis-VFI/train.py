@@ -31,8 +31,13 @@ from tqdm import tqdm
 def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(2, 1), freeze_epochs=0, total_epochs=300, curriculum=False, curriculum_T=50, crop_size=256, lr=2e-4):
     if local_rank == 0:
         writer = SummaryWriter(f'log/train_{MODEL_CONFIG["LOGNAME"]}')
+        writer_val = SummaryWriter(f'log/validate_{MODEL_CONFIG["LOGNAME"]}')
+    else:
+        writer = None
+        writer_val = None
     step = 0
     nr_eval = 0
+    best_psnr_holder = {'val': 0.0}
     
     # Freeze backbone if requested
     if freeze_epochs > 0:
@@ -103,7 +108,7 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
             train_time_interval = time.time() - time_stamp
             time_stamp = time.time()
             
-            if step % 200 == 1 and local_rank == 0:
+            if step % 200 == 1 and local_rank == 0 and writer is not None:
                 writer.add_scalar('learning_rate', learning_rate, step)
                 for k, v in loss_dict.items():
                     writer.add_scalar(f'loss/{k}', v, step)
@@ -115,13 +120,13 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
             step += 1
         nr_eval += 1
         if nr_eval % 3 == 0:
-            evaluate(model, val_data, nr_eval, local_rank)
+            evaluate(model, val_data, nr_eval, local_rank, writer_val=writer_val, best_psnr_holder=best_psnr_holder)
         model.save_model(local_rank)    
         dist.barrier()
 
-def evaluate(model, val_data, nr_eval, local_rank, best_psnr=[0.]):
-    if local_rank == 0:
-        writer_val = SummaryWriter(f'log/validate_{MODEL_CONFIG["LOGNAME"]}')
+def evaluate(model, val_data, nr_eval, local_rank, writer_val=None, best_psnr_holder=None):
+    if best_psnr_holder is None:
+        best_psnr_holder = {'val': 0.0}
 
     psnr_list = []
     ssim_list = []
@@ -138,11 +143,12 @@ def evaluate(model, val_data, nr_eval, local_rank, best_psnr=[0.]):
     avg_ssim = np.array(ssim_list).mean()
     if local_rank == 0:
         print(f"Evaluation Epoch {nr_eval}, PSNR: {avg_psnr:.4f}, SSIM: {avg_ssim:.4f}")
-        writer_val.add_scalar('psnr', avg_psnr, nr_eval)
-        writer_val.add_scalar('ssim', avg_ssim, nr_eval)
+        if writer_val is not None:
+            writer_val.add_scalar('psnr', avg_psnr, nr_eval)
+            writer_val.add_scalar('ssim', avg_ssim, nr_eval)
         # Save best model
-        if avg_psnr > best_psnr[0]:
-            best_psnr[0] = avg_psnr
+        if avg_psnr > best_psnr_holder['val']:
+            best_psnr_holder['val'] = avg_psnr
             model.save_model(rank=0, suffix='_best')
             print(f"  ★ New best PSNR: {avg_psnr:.4f}, saved as ckpt/{model.name}_best.pkl")
         

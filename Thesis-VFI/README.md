@@ -151,6 +151,21 @@ python demo_2x.py --model thesis_v1 --video input.mp4 --scale 1.0
 - mamba-ssm >= 2.0 (includes Mamba2)
 - einops, timm, opencv-python
 
+## Changelog
+
+### v9.1 (2026-02-08)
+- **Training robustness**: Gradient clipping (max_norm=1.0), optimizer/scaler state resume
+- **Dataset**: `crop_size` parameter for curriculum learning, X4K resize safety
+- **Benchmark**: Fixed XTest_8X double quantization, improved PSNR accuracy
+- **Loss**: VGG perceptual loss uses `register_buffer` (no per-forward device transfer)
+- **Backbone**: Mamba2 import failure raises explicit error instead of silent fallback
+
+### v9.0 (2026-02-07)
+- Composite loss with phase-aware weights (LapLoss + Ternary + VGG + FlowSmoothness)
+- mHC rewrite: 3-matrix log-space Sinkhorn (matches reference)
+- Interleaved SS2D scanning from VFIMamba
+- MaTVLM-style attention→Mamba2 initialization
+
 ---
 
 *Last updated: 2026-02-04 (v4.1 -- SS2D, ECAB, RIFE Refinement)*

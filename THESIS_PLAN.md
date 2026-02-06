@@ -808,6 +808,25 @@ df.to_csv('optuna_phase1_results.csv', index=False)
 
 ---
 
+### 6.6 訓練管線穩健性改進 (v9.1)
+
+以下改進已在程式碼中實作，確保訓練穩定性：
+
+| 改進項 | 檔案 | 說明 |
+| :--- | :--- | :--- |
+| 梯度裁剪 | `Trainer.py` | `clip_grad_norm_(max_norm=1.0)` 防止梯度爆炸 |
+| 優化器狀態儲存/載入 | `Trainer.py` | 儲存 optimizer + GradScaler 狀態，確保正確 resume |
+| Dataset crop_size 參數化 | `dataset.py` | `VimeoDataset(crop_size=(h,w))` 支援 curriculum learning |
+| MixedDataset 長度修正 | `dataset.py` | `__len__` 使用 ratio-aware max 而非 sum |
+| X4K resize safety | `dataset.py` | `X4KDataset.aug()` 自動 resize 過小圖片 |
+| TensorBoard writer 單例 | `train.py` | `writer_val` 在 train() 中建立一次，傳入 evaluate() |
+| 可變預設值修正 | `train.py` | `best_psnr=[0.]` → `best_psnr_holder={'val': 0.0}` |
+| VGG Loss 裝置處理 | `model/loss.py` | 移除冗餘 forward() 中的裝置轉移，使用 `register_buffer` |
+| Mamba2 匯入失敗處理 | `model/backbone.py` | 明確 `raise ImportError` 而非靜默退化為 `nn.Identity` |
+| XTest 量化修正 | `benchmark/XTest_8X.py` | 移除 float→uint8→float 雙重量化，直接在 tensor 上 round |
+
+---
+
 ## 7. 參考文獻 (Key References)
 
 | 技術 | 論文 | 引用 |
@@ -824,5 +843,5 @@ df.to_csv('optuna_phase1_results.csv', index=False)
 
 ---
 
-*文件更新日期：2026-02-07*
-*版次：v9.0 (新增 §5 損失函式策略, CompositeLoss 階段感知設計, Ternary/FlowSmoothness 整合, TensorBoard 逐組件記錄)*
+*文件更新日期：2026-02-08*
+*版次：v9.1 (訓練管線穩健性改進：梯度裁剪、optimizer state resume、dataset crop 參數化、benchmark 修正)*

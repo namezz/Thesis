@@ -61,8 +61,14 @@ class X4KDataset(Dataset):
 
     def aug(self, img0, gt, img1, h, w):
         ih, iw, _ = img0.shape
-        # Random Crop (Phase 3 Requirement: Focus on high-res textures)
-        # We can implement a more sophisticated 'high-freq' crop if needed
+        # Resize if image is smaller than target crop
+        if ih < h or iw < w:
+            scale = max(h / ih, w / iw)
+            new_h, new_w = int(ih * scale) + 1, int(iw * scale) + 1
+            img0 = cv2.resize(img0, (new_w, new_h))
+            gt = cv2.resize(gt, (new_w, new_h))
+            img1 = cv2.resize(img1, (new_w, new_h))
+            ih, iw = new_h, new_w
         x = np.random.randint(0, ih - h + 1)
         y = np.random.randint(0, iw - w + 1)
         img0 = img0[x:x+h, y:y+w, :]
@@ -109,8 +115,9 @@ class MixedDataset(Dataset):
         self.total_weight = sum(ratio)
 
     def __len__(self):
-        # Return length of the larger dataset scaled by ratio or just Vimeo length
-        return self.v_len + self.x_len
+        # Use max of weighted lengths to ensure all data is covered
+        v_w, x_w = self.ratio
+        return max(self.v_len, int(self.x_len * v_w / max(x_w, 1)))
 
     def __getitem__(self, index):
         # Sample based on ratio
@@ -125,11 +132,11 @@ class MixedDataset(Dataset):
             return self.vimeo[random.randint(0, self.v_len - 1)]
 
 class VimeoDataset(Dataset):
-    def __init__(self, dataset_name, path, batch_size=32):
+    def __init__(self, dataset_name, path, batch_size=32, crop_size=None):
         self.batch_size = batch_size
         self.dataset_name = dataset_name
-        self.h = 256
-        self.w = 448
+        self.h = crop_size[0] if crop_size else 256
+        self.w = crop_size[1] if crop_size else 448
         self.data_root = path
         self.image_root = os.path.join(self.data_root, 'sequences')
         
@@ -189,7 +196,7 @@ class VimeoDataset(Dataset):
         img0, gt, img1 = self.getimg(index)
                 
         if 'train' in self.dataset_name:
-            img0, gt, img1 = self.aug(img0, gt, img1, 256, 256)
+            img0, gt, img1 = self.aug(img0, gt, img1, self.h, self.w)
             if random.uniform(0, 1) < 0.5:
                 img0 = img0[:, :, ::-1]
                 img1 = img1[:, :, ::-1]

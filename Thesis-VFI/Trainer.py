@@ -58,6 +58,15 @@ class Model:
                 elif not has_module and ckpt_has_module:
                     state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
                 self.net.load_state_dict(state_dict, strict=False)
+                # Load optimizer state if available
+                optim_path = f'ckpt/{name}_optim.pkl'
+                if os.path.exists(optim_path):
+                    optim_state = torch.load(optim_path, map_location='cpu', weights_only=True)
+                    if 'optimizer' in optim_state:
+                        self.optimG.load_state_dict(optim_state['optimizer'])
+                    if 'scaler' in optim_state:
+                        self.scaler.load_state_dict(optim_state['scaler'])
+                    print(f"  Loaded optimizer state from {optim_path}")
             else:
                 print(f"No checkpoint found at {path}, starting from scratch.")
     
@@ -66,6 +75,11 @@ class Model:
             # Save without 'module.' prefix for portability
             state_dict = self.net.module.state_dict() if hasattr(self.net, 'module') else self.net.state_dict()
             torch.save(state_dict, f'ckpt/{self.name}{suffix}.pkl')
+            # Save optimizer + scaler state for proper resume
+            torch.save({
+                'optimizer': self.optimG.state_dict(),
+                'scaler': self.scaler.state_dict(),
+            }, f'ckpt/{self.name}{suffix}_optim.pkl')
 
     @torch.no_grad()
     def inference(self, img0, img1, TTA=False, timestep=0.5, fast_TTA=False):
@@ -113,6 +127,8 @@ class Model:
             
             self.optimG.zero_grad()
             self.scaler.scale(loss_total).backward()
+            self.scaler.unscale_(self.optimG)
+            torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
             self.scaler.step(self.optimG)
             self.scaler.update()
             return pred, loss_dict
