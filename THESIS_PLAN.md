@@ -212,118 +212,380 @@ python benchmark/MiddleBury_Other.py --model thesis_v1 --path /home/code-server/
 ---
 
 ### 第二階段：光流導引增強 (Phase 2: Motion-Aware Guidance)
-**目標**：引入 IFNet-style 光流估計與 Feature Pre-warping。
+**目標**：引入 IFNet-style 光流估計與 Feature Pre-warping，大幅提升大動作場景 (SNU-FILM Hard/Extreme) 的插補品質。
 
 #### 4.2.1 核心改進
-- **Flow Module**: 輕量級 3-scale 光流估計器 (參考 IFNet/RIFE)，輸出雙向光流 + 融合 mask
-- **Feature-level Warping**: 在特徵空間進行 warp 而非 image-level
-- **RefineNet**: 光流 mask 與精煉 mask 結合 (`sigmoid(flow_mask + refine_mask)`)
+- **Flow Module**: 輕量級 3-scale 光流估計器 (參考 IFNet/RIFE)，輸出雙向光流 `(B, 4, H, W)` + 融合 mask `(B, 1, H, W)`
+- **Feature-level Warping**: 在特徵空間進行 warp 而非 image-level，保留更多語義資訊
+- **RefineNet**: 光流 mask 與精煉 mask 結合 `sigmoid(flow_mask + refine_mask)`，由兩個模組共同決定融合權重
+- **Freeze-then-Unfreeze**: 前 50 個 epoch 凍結 backbone，僅訓練 flow estimator 與 RefineNet，避免破壞 Phase 1 學到的表徵
 
-#### 4.2.2 訓練指令
+#### 4.2.2 整體 Pipeline (Phase 2)
+```
+I_0, I_1 --> OpticalFlowEstimator (3-scale IFNet)
+    --> flow (B,4,H,W), flow_mask (B,1,H,W)
+    --> warp(I_0, flow_01), warp(I_1, flow_10)
+
+warped_I_0, warped_I_1 --> [batch concat] --> HybridBackbone (frozen 50 epochs)
+    --> Multi-scale features
+
+features --> RefineNet --> residual + refine_mask
+    --> mask = sigmoid(flow_mask + refine_mask)
+    --> I_t = warped_I_0 * mask + warped_I_1 * (1 - mask) + residual
+```
+
+#### 4.2.3 訓練配置
+| 項目 | 設定 |
+| :--- | :--- |
+| 訓練資料 | Vimeo90K Septuplet (同 Phase 1) |
+| Optimizer | AdamW, lr=1e-4 (降低 lr 避免破壞 backbone), weight_decay=1e-4 |
+| LR Schedule | Linear warmup 2000 steps → Cosine decay to 1e-5 |
+| Batch Size | **2 (V100 16GB)** / **8 (RTX 5090 32GB)** / **16 (A100 80GB)** |
+| Precision | AMP (Mamba2 core in FP32) |
+| Loss | Laplacian Pyramid L1 + 0.01 × VGG Perceptual |
+| Epochs | 200 |
+| Backbone Freeze | 前 50 epochs 凍結 backbone，之後全模型微調 |
+| 初始化 | 從 Phase 1 最佳 checkpoint (`phase1_hybrid_best.pkl`) 載入 |
+
+#### 4.2.4 訓練指令
 
 ```bash
 # ============================================================
-# Phase 2: 從 Phase 1 最佳 checkpoint 微調
+# 環境準備
 # ============================================================
-# 單 GPU (V100)
+source /home/code-server/josh/anaconda3/bin/activate vfimamba
+cd /home/code-server/josh/my_code/Thesis-VFI
+
+# ============================================================
+# Step 0: 確認 Phase 1 最佳模型存在
+# ============================================================
+ls -la ckpt/phase1_hybrid_best.pkl
+# 若只有 phase1_hybrid.pkl (最後一個 epoch)，也可使用：
+# ls -la ckpt/phase1_hybrid.pkl
+
+# ============================================================
+# Step 1: Phase 2 快速驗證 (Dry Run)
+# ============================================================
 torchrun --nproc_per_node=1 train.py \
     --batch_size 2 \
     --data_path /home/code-server/josh/datasets/video90k/vimeo_septuplet \
+    --phase 2 --dry_run \
+    --resume phase1_hybrid_best \
+    --freeze_backbone 1
+
+# ============================================================
+# Step 2: Phase 2 主實驗 (Exp-2c: Feature-level Warping)
+# ============================================================
+# 單 GPU (V100 16GB) — 開發環境
+torchrun --nproc_per_node=1 train.py \
+    --batch_size 2 --lr 1e-4 \
+    --data_path /home/code-server/josh/datasets/video90k/vimeo_septuplet \
     --phase 2 --epochs 200 \
-    --resume phase1_hybrid \
+    --resume phase1_hybrid_best \
     --freeze_backbone 50 \
     --exp_name exp2c_feature_warp
 
-# 多 GPU (4x A100)
-torchrun --nproc_per_node=4 train.py \
-    --batch_size 16 \
+# 單 GPU (RTX 5090 32GB) — 雲端
+torchrun --nproc_per_node=1 train.py \
+    --batch_size 8 --lr 1e-4 \
     --data_path /path/to/vimeo_septuplet \
     --phase 2 --epochs 200 \
-    --resume phase1_hybrid \
+    --resume phase1_hybrid_best \
+    --freeze_backbone 50 \
+    --exp_name exp2c_feature_warp
+
+# 多 GPU (4x A100 80GB) — 雲端
+torchrun --nproc_per_node=4 train.py \
+    --batch_size 16 --lr 1e-4 \
+    --data_path /path/to/vimeo_septuplet \
+    --phase 2 --epochs 200 \
+    --resume phase1_hybrid_best \
     --freeze_backbone 50 \
     --exp_name exp2c_feature_warp
 
 # ============================================================
-# Phase 2 Ablation
+# Step 3: Phase 2 Ablation Studies
 # ============================================================
-# Exp-2a: Phase 1 baseline 直接評估 SNU-FILM (no flow)
-python benchmark/SNU_FILM.py --model thesis_v1 --path /home/code-server/josh/datasets/SUN-FILM
+# Exp-2a: Phase 1 baseline 直接評估 SNU-FILM (no flow, 不需要訓練)
+python benchmark/SNU_FILM.py \
+    --model phase1_hybrid_best \
+    --path /home/code-server/josh/datasets/SNU-FILM
 
-# Exp-2b: Image-level warping
+# Exp-2b: Image-level warping (對比 feature-level)
+# 注意：需修改 model/__init__.py 中的 warp 目標為 image-level
 torchrun --nproc_per_node=1 train.py \
-    --batch_size 2 \
+    --batch_size 2 --lr 1e-4 \
     --data_path /home/code-server/josh/datasets/video90k/vimeo_septuplet \
     --phase 2 --epochs 200 \
-    --resume phase1_hybrid \
+    --resume phase1_hybrid_best \
+    --freeze_backbone 50 \
     --exp_name exp2b_image_warp
+
+# ============================================================
+# Step 4: 監控與評估
+# ============================================================
+# TensorBoard
+tensorboard --logdir log --port 6006
+
+# Phase 2 完成後 Benchmark
+python benchmark/Vimeo90K.py --model exp2c_feature_warp_best --path /home/code-server/josh/datasets/video90k/vimeo_septuplet
+python benchmark/UCF101.py --model exp2c_feature_warp_best --path /home/code-server/josh/datasets/UCF101
+python benchmark/SNU_FILM.py --model exp2c_feature_warp_best --path /home/code-server/josh/datasets/SNU-FILM
+python benchmark/MiddleBury_Other.py --model exp2c_feature_warp_best --path /home/code-server/josh/datasets/MiddleBury
+
+# 推理速度測試
+python benchmark/TimeTest.py --model exp2c_feature_warp_best --resolution 720p
+python benchmark/TimeTest.py --model exp2c_feature_warp_best --resolution 1080p
 ```
 
-#### 4.2.3 Phase 2 Ablation Study
-- **Exp-2a**: Phase 1 baseline (no flow) — 直接用 Phase 1 model 評估
-- **Exp-2b**: Image-level warping + Backbone + RefineNet
-- **Exp-2c**: Feature-level warping (main) — `--phase 2`
-- **Exp-2d**: Flow-only baseline (no backbone features)
-- **Exp-2e**: Feature warp + FlowFormer++ distillation
+#### 4.2.5 Phase 2 Ablation Study
+- **Exp-2a**: Phase 1 baseline (no flow) — 直接用 Phase 1 model 評估 SNU-FILM，作為下界
+- **Exp-2b**: Image-level warping + Backbone + RefineNet — 對比 feature-level 的效果
+- **Exp-2c**: Feature-level warping (main) — `--phase 2` 預設行為
+- **Exp-2d**: Flow-only baseline (no backbone features) — 驗證 backbone 是否有貢獻
+- **Exp-2e**: Feature warp + FlowFormer++ distillation — 進階實驗，用更好的光流監督
 
-#### 4.2.4 Phase 2 驗證指標
+#### 4.2.6 Phase 2 驗證指標
 - SNU-FILM Hard PSNR ≥ 30.0 dB, SSIM ≥ 0.90
 - SNU-FILM Extreme PSNR ≥ 26.0 dB, SSIM ≥ 0.85
+- SNU-FILM Easy PSNR ≥ 39.5 dB
+- SNU-FILM Medium PSNR ≥ 35.0 dB
 - Vimeo90K PSNR ≥ Phase 1 baseline (no regression)
-- 大動作場景視覺對比
+- UCF101 PSNR ≥ 35.0 dB
+- 大動作場景視覺對比 (SNU-FILM Hard/Extreme 定性評估)
+- 推理速度：720p ≤ 2× VFIMamba latency
+
+#### 4.2.7 Phase 2 疑難排解 (Troubleshooting)
+- **PSNR 大幅退步**：檢查 `--freeze_backbone` 是否生效，前 50 epoch backbone 梯度應為 0
+- **Loss 不收斂**：降低 lr 至 5e-5，或增加 freeze_backbone epochs
+- **大動作模糊未改善**：檢查 flow estimator 輸出是否合理 (可視化光流向量場)
+- **VRAM OOM (V100)**：確認 `--batch_size 2`，Phase 2 因增加 flow module 會多用約 1-2GB VRAM
 
 ---
 
 ### 第三階段：4K 高解析度紋理 (Phase 3: High-Fidelity Synthesis)
-**目標**：X4K1000FPS Curriculum Learning。
+**目標**：透過 X4K1000FPS 混合訓練與 Curriculum Learning，提升 4K 超高解析度場景的紋理保持與插補品質。
 
 #### 4.3.1 核心改進
-- **Curriculum Learning**: 漸進式解析度訓練 (256→384→512)
-- **Mixed Training**: Vimeo90K + X4K1000FPS 混合訓練
-- **Scale Parameter**: 支援 `--scale` 參數調整 optical flow 解析度
+- **Curriculum Learning**: 漸進式解析度訓練 `(256→384→512)`，每階段持續 `curriculum_T` 個 epoch
+  - Epoch 0 ~ T-1: crop_size = 256 (暖身)
+  - Epoch T ~ 2T-1: crop_size = 384 (中間解析度)
+  - Epoch 2T ~: crop_size = 512 (高解析度)
+- **Mixed Training**: Vimeo90K + X4K1000FPS 混合訓練，比例由 `--mixed_ratio` 控制 (預設 2:1)
+- **X4K Temporal Subsampling**: X4K1000FPS 使用隨機 stride (8~32 frames) 採樣，模擬不同運動速度
+- **Scale Parameter**: 推理時使用 `--scale 0.25` 對 4K 影像降採樣做光流估計，再上採樣回 4K
 
-#### 4.3.2 訓練指令
+#### 4.3.2 整體 Pipeline (Phase 3)
+```
+[Training]
+Vimeo90K (256×256) + X4K1000FPS (256→384→512) 混合採樣
+    --> Phase 2 完整 Pipeline (flow + backbone + refine)
+    --> Curriculum crop size 漸進增大
+
+[Inference - 4K]
+I_0, I_1 (3840×2160) --> scale=0.25 --> flow estimation at 960×540
+    --> 上採樣 flow 到 3840×2160
+    --> warp + backbone + refine --> I_t (3840×2160)
+```
+
+#### 4.3.3 訓練配置
+| 項目 | 設定 |
+| :--- | :--- |
+| 訓練資料 | Vimeo90K + X4K1000FPS 混合 (ratio 2:1) |
+| Optimizer | AdamW, lr=5e-5 (更低 lr 精修), weight_decay=1e-4 |
+| LR Schedule | Linear warmup 2000 steps → Cosine decay to 5e-6 |
+| Batch Size | **2 (V100 16GB)** / **4-8 (RTX 5090 32GB)** / **8-16 (A100 80GB)** |
+| Precision | AMP (Mamba2 core in FP32) |
+| Loss | Laplacian Pyramid L1 + 0.01 × VGG Perceptual |
+| Epochs | 100 (Curriculum: 33+33+34) |
+| Curriculum | 256→384→512, transition T=33 |
+| 初始化 | 從 Phase 2 最佳 checkpoint (`exp2c_feature_warp_best.pkl`) 載入 |
+
+#### 4.3.4 訓練指令
 
 ```bash
 # ============================================================
-# Phase 3: 從 Phase 2 最佳 checkpoint 微調
+# 環境準備
 # ============================================================
-# Mixed Training (Vimeo + X4K, ratio 2:1)
-torchrun --nproc_per_node=4 train.py \
-    --batch_size 8 \
+source /home/code-server/josh/anaconda3/bin/activate vfimamba
+cd /home/code-server/josh/my_code/Thesis-VFI
+
+# ============================================================
+# Step 0: 確認前置條件
+# ============================================================
+# 確認 Phase 2 最佳模型存在
+ls -la ckpt/exp2c_feature_warp_best.pkl
+
+# 確認 X4K1000FPS 資料集可用
+ls /home/code-server/josh/datasets/X4K1000FPS/train/ | head -5
+
+# ============================================================
+# Step 1: Phase 3 快速驗證 (Dry Run)
+# ============================================================
+torchrun --nproc_per_node=1 train.py \
+    --batch_size 2 \
+    --data_path /home/code-server/josh/datasets/video90k/vimeo_septuplet \
+    --x4k_path /home/code-server/josh/datasets/X4K1000FPS \
+    --phase 3 --dry_run \
+    --resume exp2c_feature_warp_best
+
+# ============================================================
+# Step 2: Phase 3 主實驗方案 A — Mixed Training (無 Curriculum)
+# ============================================================
+# Exp-3c: Mixed Vimeo + X4K (baseline comparison)
+# 單 GPU (V100 16GB)
+torchrun --nproc_per_node=1 train.py \
+    --batch_size 2 --lr 5e-5 \
+    --data_path /home/code-server/josh/datasets/video90k/vimeo_septuplet \
+    --x4k_path /home/code-server/josh/datasets/X4K1000FPS \
+    --mixed_ratio 2:1 \
+    --phase 3 --epochs 100 \
+    --resume exp2c_feature_warp_best \
+    --exp_name exp3c_mixed
+
+# 單 GPU (RTX 5090 32GB)
+torchrun --nproc_per_node=1 train.py \
+    --batch_size 4 --lr 5e-5 \
     --data_path /path/to/vimeo_septuplet \
     --x4k_path /path/to/X4K1000FPS \
     --mixed_ratio 2:1 \
     --phase 3 --epochs 100 \
-    --resume phase2_best \
+    --resume exp2c_feature_warp_best \
     --exp_name exp3c_mixed
 
-# Curriculum Learning
+# 多 GPU (4x A100 80GB)
 torchrun --nproc_per_node=4 train.py \
-    --batch_size 8 \
+    --batch_size 8 --lr 5e-5 \
     --data_path /path/to/vimeo_septuplet \
     --x4k_path /path/to/X4K1000FPS \
+    --mixed_ratio 2:1 \
     --phase 3 --epochs 100 \
-    --resume phase2_best \
-    --curriculum --curriculum_T 50 \
+    --resume exp2c_feature_warp_best \
+    --exp_name exp3c_mixed
+
+# ============================================================
+# Step 3: Phase 3 主實驗方案 B — Curriculum Learning (推薦)
+# ============================================================
+# Exp-3d: Curriculum (256→384→512)
+# 單 GPU (V100 16GB) — 注意 512 crop 可能 OOM，需減小 batch
+torchrun --nproc_per_node=1 train.py \
+    --batch_size 2 --lr 5e-5 \
+    --data_path /home/code-server/josh/datasets/video90k/vimeo_septuplet \
+    --x4k_path /home/code-server/josh/datasets/X4K1000FPS \
+    --mixed_ratio 2:1 \
+    --phase 3 --epochs 100 \
+    --resume exp2c_feature_warp_best \
+    --curriculum --curriculum_T 33 \
+    --exp_name exp3d_curriculum
+
+# 單 GPU (RTX 5090 32GB)
+torchrun --nproc_per_node=1 train.py \
+    --batch_size 4 --lr 5e-5 \
+    --data_path /path/to/vimeo_septuplet \
+    --x4k_path /path/to/X4K1000FPS \
+    --mixed_ratio 2:1 \
+    --phase 3 --epochs 100 \
+    --resume exp2c_feature_warp_best \
+    --curriculum --curriculum_T 33 \
+    --exp_name exp3d_curriculum
+
+# 多 GPU (4x A100 80GB) — 推薦設定
+torchrun --nproc_per_node=4 train.py \
+    --batch_size 8 --lr 5e-5 \
+    --data_path /path/to/vimeo_septuplet \
+    --x4k_path /path/to/X4K1000FPS \
+    --mixed_ratio 2:1 \
+    --phase 3 --epochs 100 \
+    --resume exp2c_feature_warp_best \
+    --curriculum --curriculum_T 33 \
     --exp_name exp3d_curriculum
 
 # ============================================================
-# 4K Benchmark
+# Step 4: Phase 3 Ablation Studies
 # ============================================================
-python benchmark/XTest_8X.py --model thesis_v1 --path /home/code-server/josh/datasets/X4K1000FPS --scale 0.25
+# Exp-3a: Phase 2 直接 4K 測試 (no fine-tune, 不需要訓練)
+python benchmark/XTest_8X.py \
+    --model exp2c_feature_warp_best \
+    --path /home/code-server/josh/datasets/X4K1000FPS
+
+# Exp-3b: X4K fine-tune only (no Vimeo mixing)
+torchrun --nproc_per_node=1 train.py \
+    --batch_size 2 --lr 5e-5 \
+    --data_path /home/code-server/josh/datasets/video90k/vimeo_septuplet \
+    --x4k_path /home/code-server/josh/datasets/X4K1000FPS \
+    --mixed_ratio 0:1 \
+    --phase 3 --epochs 100 \
+    --resume exp2c_feature_warp_best \
+    --exp_name exp3b_x4k_only
+
+# ============================================================
+# Step 5: 監控與評估
+# ============================================================
+# TensorBoard
+tensorboard --logdir log --port 6006
+
+# Phase 3 完成後 — 完整 Benchmark Suite
+# (1) 確認 Vimeo90K 沒退步
+python benchmark/Vimeo90K.py \
+    --model exp3d_curriculum_best \
+    --path /home/code-server/josh/datasets/video90k/vimeo_septuplet
+
+# (2) UCF101
+python benchmark/UCF101.py \
+    --model exp3d_curriculum_best \
+    --path /home/code-server/josh/datasets/UCF101
+
+# (3) SNU-FILM (4 levels)
+python benchmark/SNU_FILM.py \
+    --model exp3d_curriculum_best \
+    --path /home/code-server/josh/datasets/SNU-FILM
+
+# (4) X-TEST 4K/2K (核心 Phase 3 指標)
+python benchmark/XTest_8X.py \
+    --model exp3d_curriculum_best \
+    --path /home/code-server/josh/datasets/X4K1000FPS
+
+# (5) MiddleBury
+python benchmark/MiddleBury_Other.py \
+    --model exp3d_curriculum_best \
+    --path /home/code-server/josh/datasets/MiddleBury
+
+# (6) 推理速度測試 (各解析度)
+python benchmark/TimeTest.py --model exp3d_curriculum_best --resolution 720p
+python benchmark/TimeTest.py --model exp3d_curriculum_best --resolution 1080p
+python benchmark/TimeTest.py --model exp3d_curriculum_best --resolution 4k
+
+# (7) FLOPs & 參數量統計
+python -c "
+from model import ThesisModel
+from thop import profile
+import torch
+from config import PHASE3_CONFIG
+model = ThesisModel(PHASE3_CONFIG['MODEL_ARCH']).cuda()
+x = torch.randn(1, 6, 256, 448).cuda()
+flops, params = profile(model, inputs=(x,))
+print(f'FLOPs: {flops/1e9:.2f}G, Params: {params/1e6:.2f}M')
+"
 ```
 
-#### 4.3.3 Phase 3 Ablation Study
-- **Exp-3a**: Phase 2 直接 4K 測試 (no fine-tune)
-- **Exp-3b**: X4K fine-tune only
-- **Exp-3c**: Mixed Vimeo + X4K training
-- **Exp-3d**: Curriculum learning (main)
+#### 4.3.5 Phase 3 Ablation Study
+- **Exp-3a**: Phase 2 直接 4K 測試 (no fine-tune) — 確認 Phase 2 model 在 4K 的基線
+- **Exp-3b**: X4K fine-tune only (no Vimeo mixing) — 驗證是否需要混合訓練
+- **Exp-3c**: Mixed Vimeo + X4K training (without curriculum) — 與 curriculum 比較
+- **Exp-3d**: Curriculum learning (main, **推薦**) — 漸進式 256→384→512
 
-#### 4.3.4 Phase 3 驗證指標
-- X-TEST 4K PSNR ≥ 30.0 dB
+#### 4.3.6 Phase 3 驗證指標
+- X-TEST 4K PSNR ≥ 30.0 dB, SSIM ≥ 0.88
 - X-TEST 2K PSNR ≥ 33.0 dB
 - 4K 推理延遲 ≤ 300ms/frame (single GPU)
-- 髮絲、紋理細節視覺改善
+- Vimeo90K PSNR ≥ Phase 2 baseline (no regression)
+- 髮絲、紋理細節視覺改善 (定性評估)
+
+#### 4.3.7 Phase 3 疑難排解 (Troubleshooting)
+- **512 crop OOM (V100)**：V100 16GB 上 512×512 crop 幾乎確定 OOM，建議用 RTX 5090/A100 或降到 batch_size=1
+- **X4K 資料集 scene 太少**：X4K1000FPS train 有限，若 overfitting 明顯，增加 mixed_ratio 中 Vimeo 的比重 (如 3:1)
+- **4K 推理 OOM**：使用 `--scale 0.25` 降低光流估計解析度，或使用 `model.hr_inference(scale=0.25)`
+- **PSNR 退步 on Vimeo90K**：表示 4K 微調破壞了通用能力，增加 Vimeo 比重或降低 lr
 
 ---
 
@@ -375,4 +637,4 @@ python benchmark/XTest_8X.py --model thesis_v1 --path /home/code-server/josh/dat
 ---
 
 *文件更新日期：2026-02-06*
-*版次：v6.0 (Added Interleaved SS2D §3.4, detailed training commands, memory guidelines, MaTVLM partial init status)*
+*版次：v7.0 (Phase 2/3 詳細步驟補齊, curriculum learning 實作, best model saving, 完整 benchmark 指令)*

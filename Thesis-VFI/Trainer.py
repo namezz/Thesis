@@ -59,11 +59,11 @@ class Model:
             else:
                 print(f"No checkpoint found at {path}, starting from scratch.")
     
-    def save_model(self, rank=0):
+    def save_model(self, rank=0, suffix=''):
         if rank == 0:
             # Save without 'module.' prefix for portability
             state_dict = self.net.module.state_dict() if hasattr(self.net, 'module') else self.net.state_dict()
-            torch.save(state_dict, f'ckpt/{self.name}.pkl')
+            torch.save(state_dict, f'ckpt/{self.name}{suffix}.pkl')
 
     @torch.no_grad()
     def inference(self, img0, img1, TTA=False, timestep=0.5, fast_TTA=False):

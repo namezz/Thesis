@@ -34,16 +34,7 @@ args = parser.parse_args()
 
 '''==========Model setting=========='''
 TTA = False
-if args.model == 'ours_small':
-    cfg.MODEL_CONFIG['LOGNAME'] = 'ours_small'
-    cfg.MODEL_CONFIG['MODEL_ARCH'] = cfg.init_model_config(
-        F = 16,
-        depth = [2, 2, 2, 2, 2]
-    )
-elif args.model == 'hybrid_v1_baseline':
-    cfg.MODEL_CONFIG['LOGNAME'] = 'hybrid_v1_baseline'
-else:
-    cfg.MODEL_CONFIG['LOGNAME'] = args.model
+cfg.MODEL_CONFIG['LOGNAME'] = args.model
 
 model = Model(-1)
 model.load_model()

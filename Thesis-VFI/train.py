@@ -17,17 +17,17 @@ from config import MODEL_CONFIG, PHASE1_CONFIG, PHASE2_CONFIG, PHASE3_CONFIG, AB
 
 device = torch.device("cuda")
 
-def get_learning_rate(step, step_per_epoch):
+def get_learning_rate(step, step_per_epoch, total_epochs=300, base_lr=2e-4, min_lr=2e-5):
     if step < 2000:
         mul = step / 2000
-        return 2e-4 * mul
+        return base_lr * mul
     else:
-        mul = np.cos((step - 2000) / (300 * step_per_epoch - 2000) * math.pi) * 0.5 + 0.5
-        return (2e-4 - 2e-5) * mul + 2e-5
+        mul = np.cos((step - 2000) / (total_epochs * step_per_epoch - 2000) * math.pi) * 0.5 + 0.5
+        return (base_lr - min_lr) * mul + min_lr
 
 from tqdm import tqdm
 
-def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(2, 1), freeze_epochs=0, total_epochs=300):
+def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(2, 1), freeze_epochs=0, total_epochs=300, curriculum=False, curriculum_T=50, crop_size=256, lr=2e-4):
     if local_rank == 0:
         writer = SummaryWriter(f'log/train_{MODEL_CONFIG["LOGNAME"]}')
     step = 0
@@ -38,12 +38,19 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
         model.freeze_backbone()
     
     vimeo_train = VimeoDataset('train', data_path)
+    vimeo_train.h = vimeo_train.w = crop_size  # Override default crop size
     if MODEL_CONFIG.get('USE_X4K_TRAINING', False) and x4k_path:
         if local_rank == 0: print(f"Phase 3: Enabling Mixed Training (Vimeo + X4K) with ratio {mixed_ratio}")
         x4k_train = X4KDataset('train', x4k_path)
         dataset = MixedDataset(vimeo_train, x4k_train, ratio=mixed_ratio)
     else:
         dataset = vimeo_train
+    
+    # Curriculum learning crop sizes
+    if curriculum:
+        curriculum_sizes = [256, 384, 512]
+        if local_rank == 0:
+            print(f"Curriculum learning enabled: sizes={curriculum_sizes}, transition at epoch {curriculum_T}")
         
     sampler = DistributedSampler(dataset)
     train_data = DataLoader(dataset, batch_size=batch_size, num_workers=4, pin_memory=True, drop_last=True, sampler=sampler)
@@ -62,6 +69,27 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
                 print(f"Epoch {epoch}: Backbone unfrozen")
         
         sampler.set_epoch(epoch)
+        
+        # Curriculum learning: update crop size
+        if curriculum:
+            if epoch < curriculum_T:
+                crop_idx = 0  # 256
+            elif epoch < curriculum_T * 2:
+                crop_idx = 1  # 384
+            else:
+                crop_idx = 2  # 512
+            crop_idx = min(crop_idx, len(curriculum_sizes) - 1)
+            new_crop = curriculum_sizes[crop_idx]
+            # Update dataset crop sizes
+            if hasattr(dataset, 'h'):
+                dataset.h, dataset.w = new_crop, new_crop
+            elif hasattr(dataset, 'vimeo'):
+                dataset.vimeo.h = dataset.vimeo.w = new_crop
+                if hasattr(dataset, 'x4k'):
+                    dataset.x4k.h = dataset.x4k.w = new_crop
+            if local_rank == 0 and (epoch == 0 or epoch == curriculum_T or epoch == curriculum_T * 2):
+                print(f"Curriculum: epoch {epoch}, crop_size={new_crop}")
+        
         # Use tqdm for progress bar
         pbar = tqdm(train_data, desc=f"Epoch {epoch}", disable=(local_rank != 0))
         for i, imgs in enumerate(pbar):
@@ -69,7 +97,7 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
             time_stamp = time.time()
             imgs = imgs.to(device, non_blocking=True) / 255.
             imgs, gt = imgs[:, 0:6], imgs[:, 6:]
-            learning_rate = get_learning_rate(step, step_per_epoch)
+            learning_rate = get_learning_rate(step, step_per_epoch, total_epochs, base_lr=lr)
             _, loss = model.update(imgs, gt, learning_rate, training=True)
             train_time_interval = time.time() - time_stamp
             time_stamp = time.time()
@@ -89,7 +117,7 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
         model.save_model(local_rank)    
         dist.barrier()
 
-def evaluate(model, val_data, nr_eval, local_rank):
+def evaluate(model, val_data, nr_eval, local_rank, best_psnr=[0.]):
     if local_rank == 0:
         writer_val = SummaryWriter(f'log/validate_{MODEL_CONFIG["LOGNAME"]}')
 
@@ -106,6 +134,11 @@ def evaluate(model, val_data, nr_eval, local_rank):
     if local_rank == 0:
         print(f"Evaluation Epoch {nr_eval}, PSNR: {psnr:.4f}")
         writer_val.add_scalar('psnr', psnr, nr_eval)
+        # Save best model
+        if psnr > best_psnr[0]:
+            best_psnr[0] = psnr
+            model.save_model(rank=0, suffix='_best')
+            print(f"  ★ New best PSNR: {psnr:.4f}, saved as ckpt/{model.name}_best.pkl")
         
 if __name__ == "__main__":    
     parser = argparse.ArgumentParser()
@@ -116,6 +149,8 @@ if __name__ == "__main__":
     parser.add_argument('--data_path', type=str, required=True, help='data path of vimeo90k')
     parser.add_argument('--x4k_path', type=str, default=None, help='data path of x4k1000fps')
     parser.add_argument('--mixed_ratio', type=str, default="2:1", help='Mixed ratio Vimeo:X4K (e.g. 2:1)')
+    parser.add_argument('--crop_size', type=int, default=256, help='Training crop size (default: 256)')
+    parser.add_argument('--lr', type=float, default=2e-4, help='Learning rate')
     # Phase control
     parser.add_argument('--phase', type=int, default=1, choices=[1, 2, 3], help='Training phase (1/2/3)')
     # Ablation experiment control
@@ -124,7 +159,7 @@ if __name__ == "__main__":
                         choices=['hybrid', 'mamba2_only', 'gated_attn_only'],
                         help='Backbone mode for ablation')
     parser.add_argument('--use_mhc', action='store_true', help='Use Manifold Hyper-Connections')
-    parser.add_argument('--use_ecab', action='store_true', default=True, help='Use ECAB (default: True)')
+    parser.add_argument('--use_ecab', action=argparse.BooleanOptionalAction, default=True, help='Use ECAB (default: True, --no-use_ecab to disable)')
     # Training control
     parser.add_argument('--epochs', type=int, default=300, help='Number of epochs')
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
@@ -214,4 +249,6 @@ if __name__ == "__main__":
     epochs = 1 if args.dry_run else args.epochs
     
     train(model, local_rank, args.batch_size, args.data_path, args.x4k_path, 
-          mixed_ratio=(v_w, x_w), freeze_epochs=freeze_epochs, total_epochs=epochs)
+          mixed_ratio=(v_w, x_w), freeze_epochs=freeze_epochs, total_epochs=epochs,
+          curriculum=args.curriculum, curriculum_T=args.curriculum_T,
+          crop_size=args.crop_size, lr=args.lr)
