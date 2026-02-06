@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data.distributed import DistributedSampler
 from config import MODEL_CONFIG, PHASE1_CONFIG, PHASE2_CONFIG, PHASE3_CONFIG, ABLATION_CONFIGS, init_model_config
+from benchmark.utils.pytorch_msssim import ssim_matlab
 
 device = torch.device("cuda")
 
@@ -121,24 +122,28 @@ def evaluate(model, val_data, nr_eval, local_rank, best_psnr=[0.]):
     if local_rank == 0:
         writer_val = SummaryWriter(f'log/validate_{MODEL_CONFIG["LOGNAME"]}')
 
-    psnr = []
+    psnr_list = []
+    ssim_list = []
     for _, imgs in enumerate(val_data):
         imgs = imgs.to(device, non_blocking=True) / 255.
         imgs, gt = imgs[:, 0:6], imgs[:, 6:]
         with torch.no_grad():
             pred, _ = model.update(imgs, gt, training=False)
         for j in range(gt.shape[0]):
-            psnr.append(-10 * math.log10(((gt[j] - pred[j]) * (gt[j] - pred[j])).mean().cpu().item()))
+            psnr_list.append(-10 * math.log10(((gt[j] - pred[j]) * (gt[j] - pred[j])).mean().cpu().item()))
+            ssim_list.append(ssim_matlab(gt[j:j+1], pred[j:j+1]).cpu().item())
    
-    psnr = np.array(psnr).mean()
+    avg_psnr = np.array(psnr_list).mean()
+    avg_ssim = np.array(ssim_list).mean()
     if local_rank == 0:
-        print(f"Evaluation Epoch {nr_eval}, PSNR: {psnr:.4f}")
-        writer_val.add_scalar('psnr', psnr, nr_eval)
+        print(f"Evaluation Epoch {nr_eval}, PSNR: {avg_psnr:.4f}, SSIM: {avg_ssim:.4f}")
+        writer_val.add_scalar('psnr', avg_psnr, nr_eval)
+        writer_val.add_scalar('ssim', avg_ssim, nr_eval)
         # Save best model
-        if psnr > best_psnr[0]:
-            best_psnr[0] = psnr
+        if avg_psnr > best_psnr[0]:
+            best_psnr[0] = avg_psnr
             model.save_model(rank=0, suffix='_best')
-            print(f"  ★ New best PSNR: {psnr:.4f}, saved as ckpt/{model.name}_best.pkl")
+            print(f"  ★ New best PSNR: {avg_psnr:.4f}, saved as ckpt/{model.name}_best.pkl")
         
 if __name__ == "__main__":    
     parser = argparse.ArgumentParser()

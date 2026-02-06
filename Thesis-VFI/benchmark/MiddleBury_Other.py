@@ -83,10 +83,10 @@ for scene in tqdm(scenes, desc="Processing scenes"):
         print(f"Warning: Failed to read images for {scene}")
         continue
     
-    # Convert to tensor (BGR -> RGB, HWC -> CHW)
-    I0_tensor = torch.from_numpy(I0[:, :, ::-1].copy().transpose(2, 0, 1)).float().unsqueeze(0).cuda() / 255.
-    I1_tensor = torch.from_numpy(I1[:, :, ::-1].copy().transpose(2, 0, 1)).float().unsqueeze(0).cuda() / 255.
-    GT_tensor = torch.from_numpy(GT[:, :, ::-1].copy().transpose(2, 0, 1)).float().unsqueeze(0).cuda() / 255.
+    # Convert to tensor (Keep BGR, consistent with training; HWC -> CHW)
+    I0_tensor = torch.from_numpy(I0.transpose(2, 0, 1).copy()).float().unsqueeze(0).cuda() / 255.
+    I1_tensor = torch.from_numpy(I1.transpose(2, 0, 1).copy()).float().unsqueeze(0).cuda() / 255.
+    GT_tensor = torch.from_numpy(GT.transpose(2, 0, 1).copy()).float().unsqueeze(0).cuda() / 255.
     
     # Padding
     padder = InputPadder(I0_tensor.shape, divisor=32)

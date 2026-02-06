@@ -38,9 +38,8 @@ def load_img_tensor(path):
     img = cv2.imread(path)
     if img is None:
         raise RuntimeError(f"無法讀取圖片內容: {path}")
-    # BGR 轉為 Tensor 並移動到 GPU (float32)
-    # 注意：若模型需要 RGB，請改為 img[:, :, ::-1].copy()
-    return torch.from_numpy(img.transpose(2, 0, 1)).float().cuda().unsqueeze(0) / 255.0
+    # Keep BGR (consistent with training data which uses cv2.imread BGR)
+    return torch.from_numpy(img.transpose(2, 0, 1).copy()).float().cuda().unsqueeze(0) / 255.0
 
 print(f'=========================Starting testing=========================')
 print(f'Dataset: UCF101   Model: {model.name}   TTA: {TTA}')
@@ -67,14 +66,13 @@ for d in tqdm(dirs):
         pred = model.inference(img0, img1, TTA=TTA, fast_TTA=TTA)[0]
 
         # 計算 SSIM (依照原程式邏輯進行 round 處理)
-        # ssim_matlab 預期輸入為 (N, C, H, W)
-        pred_clamped = torch.clamp(pred, 0, 1) # 確保數值在 0-1 之間
-        ssim = ssim_matlab(gt_tensor, torch.round(pred_clamped * 255).unsqueeze(0) / 255.).detach().cpu().numpy()
+        # pred shape: (1, C, H, W), gt_tensor shape: (1, C, H, W)
+        pred_clamped = torch.clamp(pred, 0, 1)
+        pred_rounded = torch.round(pred_clamped * 255) / 255.
+        ssim = ssim_matlab(gt_tensor, pred_rounded).detach().cpu().numpy()
 
         # 計算 PSNR
-        out_np = pred_clamped.detach().cpu().numpy().transpose(1, 2, 0)
-        out_np = np.round(out_np * 255) / 255.
-        
+        out_np = pred_rounded[0].detach().cpu().numpy().transpose(1, 2, 0)
         gt_np = gt_tensor[0].cpu().numpy().transpose(1, 2, 0)
         
         # 避免溢位與計算 MSE

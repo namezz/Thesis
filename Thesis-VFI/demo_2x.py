@@ -13,26 +13,14 @@ from Trainer import Model
 from benchmark.utils.padder import InputPadder
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--model', default='ours', type=str)
+parser.add_argument('--model', default='hybrid_v1_baseline', type=str)
 args = parser.parse_args()
-assert args.model in ['ours', 'ours_small'], 'Model not exists!'
 
 
 '''==========Model setting=========='''
 TTA = True
-if args.model == 'ours_small':
-    TTA = False
-    cfg.MODEL_CONFIG['LOGNAME'] = 'ours_small'
-    cfg.MODEL_CONFIG['MODEL_ARCH'] = cfg.init_model_config(
-        F = 16,
-        depth = [2, 2, 2, 2, 2]
-    )
-else:
-    cfg.MODEL_CONFIG['LOGNAME'] = 'ours'
-    cfg.MODEL_CONFIG['MODEL_ARCH'] = cfg.init_model_config(
-        F = 32,
-        depth = [2, 2, 2, 4, 4]
-    )
+cfg.MODEL_CONFIG['LOGNAME'] = args.model
+
 model = Model(-1)
 model.load_model()
 model.eval()
@@ -50,7 +38,7 @@ I2_ = (torch.tensor(I2.transpose(2, 0, 1)).cuda() / 255.).unsqueeze(0)
 padder = InputPadder(I0_.shape, divisor=32)
 I0_, I2_ = padder.pad(I0_, I2_)
 
-mid = (padder.unpad(model.inference(I0_, I2_, TTA=TTA, fast_TTA=TTA))[0].detach().cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
+mid = (padder.unpad(model.inference(I0_, I2_, TTA=TTA, fast_TTA=TTA)[0]).detach().cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
 images = [I0[:, :, ::-1], mid[:, :, ::-1], I2[:, :, ::-1]]
 mimsave('example/out_2x.gif', images, fps=3)
 

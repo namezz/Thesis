@@ -87,7 +87,7 @@ for strMode in ['XTEST-2k', 'XTEST-4k']:
         tenEstimate = model.hr_inference(tenOne, tenTwo, TTA = TTA, timestep=intFrame[3], down_scale = down_scale)[0]
         tenEstimate = padder.unpad(tenEstimate)
 
-        npyEstimate = (tenEstimate.detach().cpu().numpy().transpose(1, 2, 0) * 255.0).clip(0.0, 255.0).round().astype(np.uint8)
+        npyEstimate = (tenEstimate[0].detach().cpu().numpy().transpose(1, 2, 0) * 255.0).clip(0.0, 255.0).round().astype(np.uint8)
         tenEstimate = torch.FloatTensor(npyEstimate.transpose(2, 0, 1)[None, :, :, :]).cuda() / 255.0
 
         fltPsnr.append(-10 * math.log10(torch.mean((tenEstimate - tenGT) * (tenEstimate - tenGT)).cpu().data))

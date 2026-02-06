@@ -60,21 +60,20 @@ for i in f:
         continue
     # ------------------
 
-    # BGR -> RGB 轉換 (注意：cv2 讀進來是 BGR，通常 VFI 模型需要 RGB)
-    # 你原本寫 I0.transpose(2, 0, 1) 只改了維度順序，沒有換顏色通道
-    I0 = (torch.tensor(I0[:, :, ::-1].copy().transpose(2, 0, 1)).cuda().float() / 255.).unsqueeze(0)
-    I2 = (torch.tensor(I2[:, :, ::-1].copy().transpose(2, 0, 1)).cuda().float() / 255.).unsqueeze(0)
+    # Keep BGR (consistent with training data which uses cv2.imread BGR)
+    I0 = (torch.tensor(I0.transpose(2, 0, 1).copy()).cuda().float() / 255.).unsqueeze(0)
+    I2 = (torch.tensor(I2.transpose(2, 0, 1).copy()).cuda().float() / 255.).unsqueeze(0)
 
     mid = model.inference(I0, I2, TTA=TTA, fast_TTA=TTA)[0]
 
-    # I1 同樣需要處理
-    I1_tensor = torch.tensor(I1[:, :, ::-1].copy().transpose(2, 0, 1)).cuda().float().unsqueeze(0) / 255.
-    ssim = ssim_matlab(I1_tensor, mid.unsqueeze(0)).detach().cpu().numpy()
+    # I1 同樣保持 BGR
+    I1_tensor = torch.tensor(I1.transpose(2, 0, 1).copy()).cuda().float().unsqueeze(0) / 255.
+    ssim = ssim_matlab(I1_tensor, mid).detach().cpu().numpy()
 
-    mid = mid.detach().cpu().numpy().transpose(1, 2, 0) 
-    I1_norm = I1[:, :, ::-1].copy() / 255. # 轉為 RGB 且正規化以計算 PSNR
+    mid_np = mid[0].detach().cpu().numpy().transpose(1, 2, 0) 
+    I1_norm = I1 / 255.  # BGR, consistent with model output
     
-    psnr = -10 * math.log10(((I1_norm - mid) * (I1_norm - mid)).mean())
+    psnr = -10 * math.log10(((I1_norm - mid_np) * (I1_norm - mid_np)).mean())
     psnr_list.append(psnr)
     ssim_list.append(ssim)
 

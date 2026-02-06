@@ -24,25 +24,32 @@ class X4KDataset(Dataset):
         self.h = 256 # Target patch height
         self.w = 256 # Target patch width
         
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"X4K dataset path not found: {path}")
+        
         # X4K Structure: path/train/SCENE/*.png
-        # We search for all subdirectories in train
-        search_path = os.path.join(path, 'train', '*', '*')
+        search_path = os.path.join(path, 'train', '*')
         self.scenes = sorted(glob.glob(search_path))
+        if len(self.scenes) == 0:
+            raise RuntimeError(f"X4KDataset: No scenes found in {os.path.join(path, 'train')}. Check folder structure.")
         print(f"X4KDataset: Found {len(self.scenes)} scenes in {path}")
 
     def __len__(self):
         return len(self.scenes)
 
-    def getimg(self, index):
+    def getimg(self, index, _depth=0):
+        if _depth > 10:
+            raise RuntimeError("X4KDataset: Too many retries finding valid scene")
         scene_path = self.scenes[index]
         frames = sorted(glob.glob(os.path.join(scene_path, '*.png')))
         
-        if len(frames) < self.stride_range[1] + 1:
+        if len(frames) < self.stride_range[0] + 1:
             # Fallback if scene too short
-            return self.getimg(random.randint(0, len(self.scenes)-1))
+            return self.getimg(random.randint(0, len(self.scenes)-1), _depth + 1)
             
         # Temporal Subsampling (Phase 3 Requirement)
-        stride = random.randint(self.stride_range[0], self.stride_range[1])
+        max_stride = min(self.stride_range[1], len(frames) - 1)
+        stride = random.randint(self.stride_range[0], max_stride)
         # Sample t, t+stride/2, t+stride
         t = random.randint(0, len(frames) - stride - 1)
         
@@ -107,7 +114,12 @@ class MixedDataset(Dataset):
 
     def __getitem__(self, index):
         # Sample based on ratio
-        if random.random() < (self.ratio[1] / self.total_weight):
+        v_weight, x_weight = self.ratio
+        if v_weight == 0:
+            return self.x4k[random.randint(0, self.x_len - 1)]
+        elif x_weight == 0:
+            return self.vimeo[random.randint(0, self.v_len - 1)]
+        elif random.random() < (x_weight / self.total_weight):
             return self.x4k[random.randint(0, self.x_len - 1)]
         else:
             return self.vimeo[random.randint(0, self.v_len - 1)]

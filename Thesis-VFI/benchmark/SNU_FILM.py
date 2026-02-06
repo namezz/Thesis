@@ -110,10 +110,10 @@ for test_file in level_list:
             I1_raw = _ensure_image(I1_path)
             I2_raw = _ensure_image(I2_path)
 
-            # 轉換為 Tensor (注意：如果模型是 RGB，建議加 [:, :, ::-1])
-            I0 = (torch.tensor(I0_raw.transpose(2, 0, 1)).float() / 255.0).unsqueeze(0).cuda()
-            I1 = (torch.tensor(I1_raw.transpose(2, 0, 1)).float() / 255.0).unsqueeze(0).cuda()
-            I2 = (torch.tensor(I2_raw.transpose(2, 0, 1)).float() / 255.0).unsqueeze(0).cuda()
+            # 轉換為 Tensor (Keep BGR, consistent with training data)
+            I0 = (torch.tensor(I0_raw.transpose(2, 0, 1).copy()).float() / 255.0).unsqueeze(0).cuda()
+            I1 = (torch.tensor(I1_raw.transpose(2, 0, 1).copy()).float() / 255.0).unsqueeze(0).cuda()
+            I2 = (torch.tensor(I2_raw.transpose(2, 0, 1).copy()).float() / 255.0).unsqueeze(0).cuda()
 
             # Padding 處理
             padder = InputPadder(I0.shape, divisor=32)
@@ -125,11 +125,11 @@ for test_file in level_list:
             I1_pred = padder.unpad(I1_pred)
 
             # 計算 SSIM
-            ssim = ssim_matlab(I1, I1_pred.unsqueeze(0)).detach().cpu().numpy()
+            ssim = ssim_matlab(I1, I1_pred).detach().cpu().numpy()
 
-            # 計算 PSNR (BGR 空間或轉換後空間需統一)
-            I1_pred_np = I1_pred.detach().cpu().numpy().transpose(1, 2, 0)   
-            I1_target_np = I1_raw / 255.0
+            # 計算 PSNR (BGR space, consistent with model)
+            I1_pred_np = I1_pred[0].detach().cpu().numpy().transpose(1, 2, 0)   
+            I1_target_np = I1_raw / 255.0  # BGR, same as model output
             
             psnr = -10 * math.log10(((I1_target_np - I1_pred_np) ** 2).mean())
             

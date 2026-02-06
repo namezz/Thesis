@@ -620,7 +620,108 @@ print(f'FLOPs: {flops/1e9:.2f}G, Params: {params/1e6:.2f}M')
 
 ---
 
-## 5. 參考文獻 (Key References)
+## 5. 超參數調優策略 (Hyperparameter Tuning with Optuna)
+
+### 5.1 調優時機建議
+
+**強烈建議先通過 Phase 1 Baseline 再進行超參數搜索。** 理由如下：
+
+1. **驗證架構正確性為先**：如果 baseline 的 Vimeo90K PSNR 遠低於 35.0 dB，問題很可能出在架構或程式碼 bug，而非超參數
+2. **避免浪費算力**：Optuna 搜索一輪需要跑 20-50 個 trial（每個 trial 至少跑 30 epoch），若架構有問題，所有搜索都是白費的
+3. **Baseline 提供搜索上界**：知道 default 設定的表現後，才能合理設定 Optuna 的 pruning threshold
+
+**建議流程**：
+```
+Phase 1 Baseline (default params, 300 epochs)
+    ├── PSNR ≥ 35.0 ──→ ✅ 進入 Optuna 搜索 (§5.3)
+    ├── 33.0 ≤ PSNR < 35.0 ──→ ⚠️ 先手動檢查 loss curve、梯度、lr
+    └── PSNR < 33.0 ──→ ❌ 架構/程式碼有 bug，先除錯
+```
+
+### 5.2 Optuna 搜索空間 (Search Space)
+
+| 超參數 | 搜索範圍 | 類型 | 說明 |
+| :--- | :--- | :--- | :--- |
+| `lr` | `[1e-5, 5e-4]` | log-uniform | 學習率 |
+| `batch_size` | `{2, 4, 8}` | categorical | 受限於 GPU VRAM |
+| `weight_decay` | `[1e-5, 1e-3]` | log-uniform | AdamW 正則化 |
+| `warmup_steps` | `[500, 5000]` | int | 線性 warmup 步數 |
+| `loss_vgg_weight` | `[0.001, 0.1]` | log-uniform | VGG perceptual loss 權重 |
+| `window_size` | `{7, 8}` | categorical | Gated Attention 窗口大小 |
+| `use_ecab` | `{True, False}` | boolean | ECAB vs CAB |
+| `use_mhc` | `{True, False}` | boolean | mHC 殘差混合 |
+| `min_lr_ratio` | `[0.01, 0.2]` | float | Cosine decay 最終 lr / base lr |
+
+### 5.3 Optuna 執行策略
+
+```python
+# optuna_search.py (Phase 1 範例)
+import optuna
+
+def objective(trial):
+    lr = trial.suggest_float('lr', 1e-5, 5e-4, log=True)
+    wd = trial.suggest_float('weight_decay', 1e-5, 1e-3, log=True)
+    vgg_w = trial.suggest_float('loss_vgg_weight', 0.001, 0.1, log=True)
+    use_ecab = trial.suggest_categorical('use_ecab', [True, False])
+    use_mhc = trial.suggest_categorical('use_mhc', [True, False])
+    
+    # 每個 trial 訓練 30 epochs (足夠看趨勢)
+    # 使用 subprocess 呼叫 train.py
+    cmd = f"""torchrun --nproc_per_node=1 train.py \
+        --batch_size 2 --lr {lr} \
+        --data_path /path/to/vimeo_septuplet \
+        --phase 1 --epochs 30 \
+        {'--no-use_ecab' if not use_ecab else ''} \
+        {'--use_mhc' if use_mhc else ''} \
+        --exp_name optuna_trial_{trial.number}"""
+    
+    # 執行訓練，讀取 best PSNR
+    # ... (解析 TensorBoard log 或 stdout)
+    return best_psnr  # Optuna maximize
+
+study = optuna.create_study(
+    direction='maximize',
+    pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10),
+    storage='sqlite:///optuna_phase1.db',
+    study_name='phase1_hp_search'
+)
+study.optimize(objective, n_trials=30)
+```
+
+### 5.4 結果記錄與分析
+
+所有 Optuna trial 結果會自動存入 SQLite DB (`optuna_phase1.db`)，可用以下方式查閱：
+
+```bash
+# 安裝 Optuna Dashboard (可選)
+pip install optuna-dashboard
+optuna-dashboard sqlite:///optuna_phase1.db
+
+# 或用 Python 查看最佳結果
+python -c "
+import optuna
+study = optuna.load_study(study_name='phase1_hp_search', storage='sqlite:///optuna_phase1.db')
+print(f'Best PSNR: {study.best_value:.4f}')
+print(f'Best params: {study.best_params}')
+# 匯出所有 trial 結果為 CSV
+df = study.trials_dataframe()
+df.to_csv('optuna_phase1_results.csv', index=False)
+"
+```
+
+### 5.5 各 Phase 調優建議
+
+| Phase | 調優時機 | 搜索重點 | Trial 數 | Epoch/trial |
+| :--- | :--- | :--- | :--- | :--- |
+| Phase 1 | Baseline PSNR ≥ 35.0 後 | lr, weight_decay, use_ecab, use_mhc | 20-30 | 30 |
+| Phase 2 | Phase 2 baseline 收斂後 | lr, freeze_epochs, loss_vgg_weight | 15-20 | 30 |
+| Phase 3 | Phase 3 baseline 收斂後 | lr, curriculum_T, mixed_ratio | 10-15 | 30 |
+
+**注意**：每個 Phase 的 Optuna 搜索是獨立的，用不同的 `study_name` 和 `storage` 檔案。找到最佳超參數後，用完整 epochs 重新訓練一次。
+
+---
+
+## 6. 參考文獻 (Key References)
 
 | 技術 | 論文 | 引用 |
 | :--- | :--- | :--- |
@@ -637,4 +738,4 @@ print(f'FLOPs: {flops/1e9:.2f}G, Params: {params/1e6:.2f}M')
 ---
 
 *文件更新日期：2026-02-06*
-*版次：v7.0 (Phase 2/3 詳細步驟補齊, curriculum learning 實作, best model saving, 完整 benchmark 指令)*
+*版次：v8.0 (新增 §5 Optuna 超參數調優策略, benchmark bug fixes, SSIM 評估, dataset 強健性修正)*
