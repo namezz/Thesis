@@ -125,7 +125,7 @@ class LGSBlock(nn.Module):
         self.use_mhc = use_mhc
         if backbone_mode == 'hybrid':
             if use_mhc:
-                self.mhc = ManifoldResConnection(dim, num_streams=3)  # input, mamba, attn
+                self.mhc = ManifoldResConnection(dim, num_streams=3, layer_index=0)
             else:
                 self.fusion_conv = nn.Conv2d(dim * 2, dim, 1)  # 1x1 conv to merge branches
         else:
@@ -230,30 +230,48 @@ class LGSBlock(nn.Module):
         # --- Fusion / Mixing ---
         if self.backbone_mode == 'hybrid':
             if self.use_mhc:
-                x_fused_seq = self.mhc([shortcut, x_mamba, x_attn])
-                x_fused = x_fused_seq.view(twoB, H, W, C).permute(0, 3, 1, 2).contiguous()
+                # mHC width connection: mix streams and get branch input
+                branch_input, add_residual = self.mhc([shortcut, x_mamba, x_attn])
+                # The "branch" here is ECAB (channel attention applied to fused features)
+                # Reshape for ECAB: (2B, L, C) → (2B, C, H, W)
+                branch_2d = branch_input.view(twoB, H, W, C).permute(0, 3, 1, 2).contiguous()
+                if self.use_ecab:
+                    branch_2d = self.cab(branch_2d)
+                else:
+                    se_weight = self.cab(branch_2d)
+                    branch_2d = branch_2d * se_weight
+                branch_out = branch_2d.flatten(2).transpose(1, 2)  # (2B, L, C)
+                # mHC depth connection: route branch output back and add to residuals
+                x = self.drop_path(add_residual(branch_out))
             else:
                 x_cat = torch.cat([x_mamba, x_attn], dim=-1)
                 x_cat = x_cat.transpose(1, 2).view(twoB, 2*C, H, W)
                 x_fused = self.fusion_conv(x_cat)
+                # Apply channel attention
+                if self.use_ecab:
+                    x_fused = self.cab(x_fused)
+                else:
+                    se_weight = self.cab(x_fused)
+                    x_fused = x_fused * se_weight
+                x_fused = x_fused.flatten(2).transpose(1, 2)  # (B, L, C)
+                x = shortcut + self.drop_path(x_fused)
         elif self.backbone_mode == 'mamba2_only':
             x_fused = x_mamba.transpose(1, 2).view(twoB, C, H, W)
+            if self.use_ecab:
+                x_fused = self.cab(x_fused)
+            else:
+                se_weight = self.cab(x_fused)
+                x_fused = x_fused * se_weight
+            x_fused = x_fused.flatten(2).transpose(1, 2)
+            x = shortcut + self.drop_path(x_fused)
         else:  # gated_attn_only
             x_fused = x_attn.transpose(1, 2).view(twoB, C, H, W)
-        
-        # Apply channel attention
-        if self.use_ecab:
-            x_fused = self.cab(x_fused)
-        else:
-            # Standard CAB (SE-style)
-            se_weight = self.cab(x_fused)
-            x_fused = x_fused * se_weight
-            
-        x_fused = x_fused.flatten(2).transpose(1, 2)  # (B, L, C)
-        
-        if self.use_mhc and self.backbone_mode == 'hybrid':
-            x = x_fused
-        else:
+            if self.use_ecab:
+                x_fused = self.cab(x_fused)
+            else:
+                se_weight = self.cab(x_fused)
+                x_fused = x_fused * se_weight
+            x_fused = x_fused.flatten(2).transpose(1, 2)
             x = shortcut + self.drop_path(x_fused)
         
         # FFN

@@ -231,41 +231,113 @@ def interleaved_merge(x_scan, B, H, W):
     return y.permute(0, 2, 3, 1).contiguous()  # (2B, H, W, C)
 
 
-def sinkhorn_knopp(W, iterations=20):
+def sinkhorn_log(logits, num_iters=10, tau=0.05):
     """
-    Sinkhorn-Knopp algorithm to project a matrix onto the Birkhoff Polytope 
-    (doubly stochastic matrices).
-    Input W: (..., M, N)
+    Log-space Sinkhorn-Knopp: project logits onto Birkhoff Polytope (doubly stochastic).
+    Ref: mHC (Xie et al., 2025), numerically stable log-space implementation.
+    
+    Args:
+        logits: (..., M, N) raw learnable logits
+        num_iters: Sinkhorn iterations (default 10)
+        tau: temperature (default 0.05, lower = sharper)
+    Returns:
+        doubly stochastic matrix (rows & cols sum to 1, all >= 0)
     """
-    for _ in range(iterations):
-        W = W / (W.sum(dim=-1, keepdim=True) + 1e-6)
-        W = W / (W.sum(dim=-2, keepdim=True) + 1e-6)
-    return W
+    n = logits.shape[-1]
+    Z = logits / tau
+    log_marginal = torch.zeros((n,), device=logits.device, dtype=logits.dtype)
+
+    u = torch.zeros(logits.shape[:-1], device=Z.device, dtype=Z.dtype)
+    v = torch.zeros_like(u)
+
+    for _ in range(num_iters):
+        u = log_marginal - torch.logsumexp(Z + v.unsqueeze(-2), dim=-1)
+        v = log_marginal - torch.logsumexp(Z + u.unsqueeze(-1), dim=-2)
+
+    return torch.exp(Z + u.unsqueeze(-1) + v.unsqueeze(-2))
 
 
 class ManifoldResConnection(nn.Module):
     """
     mHC: Manifold-Constrained Hyper-Connections (DeepSeek, Xie et al., 2025)
-    Constrains residual mixing matrix to the Birkhoff Polytope using Sinkhorn-Knopp.
+    Ref: hyper_connections_mhc.py from lucidrains/hyper-connections
+    
+    Proper implementation with 3 learnable matrices:
+    - H_res: residual stream mixing (doubly stochastic via Sinkhorn)
+    - H_pre: branch input selection (softmax)
+    - H_post: branch output routing (softmax)
+    
+    Equation: x_{l+1} = H_res @ x_l + H_post^T * F(H_pre @ x_l)
+    
+    For VFI LGSBlock usage (num_streams=3):
+        streams = [shortcut, mamba_out, attn_out]
+        The mHC learns to optimally mix/route these signals.
     """
-    def __init__(self, dim, num_streams=2):
+    def __init__(self, dim, num_streams=3, layer_index=0,
+                 mhc_num_iters=10, mhc_tau=0.05):
         super().__init__()
         self.dim = dim
         self.num_streams = num_streams
-        self.mixing_weights = nn.Parameter(torch.eye(num_streams))
+        self.mhc_num_iters = mhc_num_iters
+        self.mhc_tau = mhc_tau
         
-    def forward(self, streams):
-        """
-        streams: List of [B, L, C] tensors
-        """
-        W = torch.exp(self.mixing_weights) 
-        W_stochastic = sinkhorn_knopp(W)
+        # H_res: residual mixing matrix (streams x streams)
+        # Init: near-identity (off-diag=-8 → exp(-8/tau)≈0, diag=0 → balanced)
+        init_h_res = torch.full((num_streams, num_streams), -8.0)
+        init_h_res.fill_diagonal_(0.0)
+        self.H_res_logits = nn.Parameter(init_h_res)
         
-        out = 0
-        for j in range(self.num_streams):
-            out = out + W_stochastic[0, j] * streams[j]
-            
-        return out
+        # H_pre: branch input selection (1 x streams)
+        # Init: select stream at layer_index
+        init_h_pre = torch.full((1, num_streams), -8.0)
+        init_h_pre[:, layer_index % num_streams] = 0.0
+        self.H_pre_logits = nn.Parameter(init_h_pre)
+        
+        # H_post: route branch output back to streams (1 x streams)
+        # Init: uniform distribution (all zeros → equal softmax)
+        self.H_post_logits = nn.Parameter(torch.zeros(1, num_streams))
+        
+    def forward(self, streams, branch_fn=None):
+        """
+        Args:
+            streams: List of num_streams tensors, each [B, L, C]
+            branch_fn: Optional callable. If None, returns (branch_input, add_residual_fn).
+                       If provided, applies it and returns fused output.
+        Returns:
+            If branch_fn is None: (branch_input, add_residual_fn)
+            If branch_fn provided: fused residual tensor [B, L, C]
+        """
+        S = self.num_streams
+        # Stack streams: (B, L, S, C)
+        x = torch.stack(streams, dim=-2)
+        
+        # === Width Connection ===
+        # H_res: mix residual streams (doubly stochastic)
+        H_res = sinkhorn_log(self.H_res_logits, self.mhc_num_iters, self.mhc_tau)  # (S, S)
+        residuals = torch.einsum('st,...sd->...td', H_res, x)  # (B, L, S, C)
+        
+        # H_pre: select branch input (softmax → weighted sum of streams)
+        H_pre = self.H_pre_logits.softmax(dim=-1)  # (1, S)
+        branch_input = torch.einsum('vs,...sd->...vd', H_pre, x)  # (B, L, 1, C)
+        branch_input = branch_input.squeeze(-2)  # (B, L, C)
+        
+        # H_post: prepare routing weights for depth connection
+        H_post = self.H_post_logits.softmax(dim=-1)  # (1, S)
+        
+        # === Depth Connection ===
+        def add_residual_fn(branch_out):
+            # Route branch output to streams: (B, L, C) → (B, L, S, C)
+            routed = torch.einsum('...d,s->...sd', branch_out, H_post[0])
+            # Add to mixed residuals
+            fused = residuals + routed  # (B, L, S, C)
+            # Sum over streams to collapse
+            return fused.sum(dim=-2)  # (B, L, C)
+        
+        if branch_fn is None:
+            return branch_input, add_residual_fn
+        
+        branch_out = branch_fn(branch_input)
+        return add_residual_fn(branch_out)
 
 
 def matvlm_init_mamba2(mamba_layer, attn_layer):

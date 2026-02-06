@@ -31,7 +31,13 @@
 
 ### 3.1 mHC: Manifold-Constrained Hyper-Connections (DeepSeek, Xie et al., Dec 2025)
 **概述**：將混合矩陣投影到 Birkhoff Polytope 上，確保信號傳遞穩定。
-**實作**：在 `LGSBlock` 中動態混合 shortcut, Mamba, 與 Attention 流。
+**實作**（參考 `lucidrains/hyper-connections` 官方實現）：
+  - **3 個可學習矩陣**：`H_res` (residual stream mixing, doubly stochastic via Sinkhorn)、`H_pre` (branch input selection, softmax)、`H_post` (branch output routing, softmax)
+  - **Log-space Sinkhorn-Knopp**: `sinkhorn_log()` 使用 `logsumexp` 確保數值穩定性，溫度 `tau=0.05`，迭代 10 次
+  - **Width-Depth 連接模式**: Width connection 混合 streams 並選取 branch 輸入 → Branch (ECAB) 處理 → Depth connection 將輸出路由回 streams
+  - **初始化**: `H_res` off-diagonal=-8.0, diagonal=0.0 (近似 identity)；`H_pre` 選擇 stream 0；`H_post` 均勻分佈
+  - **方程**: `x_{l+1} = H_res @ x_l + H_post^T * ECAB(H_pre @ x_l)`
+  - 在 `LGSBlock` 中以 `num_streams=3` (shortcut, mamba_out, attn_out) 使用
 **注意**：mHC-lite (Yang & Gao, Jan 2026) 提出僅需少量 Sinkhorn-Knopp 迭代即可達到近似效果，可降低訓練開銷。另有論文 (Jan 2026) 指出 mHC 在大規模訓練中存在 late-stage gradient explosion 風險，建議搭配 adaptive annealing。
 
 ### 3.2 Gated Attention (Qwen Team, arXiv:2505.06708, Qiu et al., May 2025)
