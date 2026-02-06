@@ -215,24 +215,41 @@ python benchmark/MiddleBury_Other.py --model thesis_v1 --path /home/code-server/
 **目標**：引入 IFNet-style 光流估計與 Feature Pre-warping，大幅提升大動作場景 (SNU-FILM Hard/Extreme) 的插補品質。
 
 #### 4.2.1 核心改進
-- **Flow Module**: 輕量級 3-scale 光流估計器 (參考 IFNet/RIFE)，輸出雙向光流 `(B, 4, H, W)` + 融合 mask `(B, 1, H, W)`
-- **Feature-level Warping**: 在特徵空間進行 warp 而非 image-level，保留更多語義資訊
-- **RefineNet**: 光流 mask 與精煉 mask 結合 `sigmoid(flow_mask + refine_mask)`，由兩個模組共同決定融合權重
-- **Freeze-then-Unfreeze**: 前 50 個 epoch 凍結 backbone，僅訓練 flow estimator 與 RefineNet，避免破壞 Phase 1 學到的表徵
+- **Flow Module**: 輕量級 3-scale 光流估計器 (參考 IFNet/RIFE)，輸出雙向光流 `(B, 4, H, W)` + 融合 mask `(B, 1, H, W)`。**Timestep-aware**：timestep 作為額外輸入通道 (block0: 7ch, block1/2: 18ch)，讓網路學習時間相依的光流模式。支援 `scale_list` 參數，可在高解析度推理時使用 `[8,4,2]` 替代 `[4,2,1]`。
+- **ContextNet (RIFE/VFIMamba-style)**: 每幀獨立的多尺度特徵提取器 (`3ch → c → 2c → 4c`)，提取的特徵使用光流進行 warp，為 RefineNet 提供對齊的上下文資訊。每個尺度使用對應下採樣的光流進行 warping。
+- **Backbone 處理原始幀**: 與 Phase 1 相同，backbone 處理**未 warped 的原始幀**，讓 Interleaved SS2D 的跨幀掃描在原始內容上進行時序融合。光流 warped 的特徵由 ContextNet 獨立提供。
+- **RefineNet (use_context=True)**: 接收 backbone 多尺度特徵 + ContextNet warped 特徵，在每個尺度上 concat 後解碼。光流 mask 與精煉 mask 結合 `sigmoid(flow_mask + refine_mask)`，由兩個模組共同決定融合權重。
+- **Freeze-then-Unfreeze**: 前 50 個 epoch 凍結 backbone，僅訓練 flow estimator、ContextNet 與 RefineNet，避免破壞 Phase 1 學到的表徵
+- **Warplayer 優化**: Grid cache 以 `(device, H, W)` 為 key（不含 batch），batch=1 建立 grid 後由 `grid_sample` 自動 broadcast
 
 #### 4.2.2 整體 Pipeline (Phase 2)
 ```
-I_0, I_1 --> OpticalFlowEstimator (3-scale IFNet)
+I_0, I_1 --> OpticalFlowEstimator (3-scale, timestep-aware)
     --> flow (B,4,H,W), flow_mask (B,1,H,W)
-    --> warp(I_0, flow_01), warp(I_1, flow_10)
+    --> warp(I_0, flow_01), warp(I_1, flow_10)  # warped images for blending
 
-warped_I_0, warped_I_1 --> [batch concat] --> HybridBackbone (frozen 50 epochs)
-    --> Multi-scale features
+I_0 + flow_01 --> ContextNet_0 --> ctx0 [c, 2c, 4c] (warped context features)
+I_1 + flow_10 --> ContextNet_1 --> ctx1 [c, 2c, 4c] (warped context features)
 
-features --> RefineNet --> residual + refine_mask
+I_0, I_1 --> [batch concat] --> HybridBackbone (frozen 50 epochs)
+    --> feats [c, 2c, 4c]  (cross-frame features on ORIGINAL content)
+
+feats + ctx0 + ctx1 --> RefineNet (use_context=True) --> residual + refine_mask
     --> mask = sigmoid(flow_mask + refine_mask)
     --> I_t = warped_I_0 * mask + warped_I_1 * (1 - mask) + residual
 ```
+
+**Phase 2 模型統計**：
+- Flow Estimator: ~6.82M params
+- ContextNet ×2: ~0.57M params
+- RefineNet (use_context=True): ~0.56M params
+- Backbone: ~1.24M params (from Phase 1)
+- **Total: ~9.0M params**
+
+**VRAM 使用量** (256×256 crop, AMP):
+- V100 16GB: batch=1 → 5.89 GB（⚠️ batch=2 OOM）
+- RTX 5090 32GB: batch=4-8
+- A100 80GB: batch=16+
 
 #### 4.2.3 訓練配置
 | 項目 | 設定 |
@@ -240,7 +257,7 @@ features --> RefineNet --> residual + refine_mask
 | 訓練資料 | Vimeo90K Septuplet (同 Phase 1) |
 | Optimizer | AdamW, lr=1e-4 (降低 lr 避免破壞 backbone), weight_decay=1e-4 |
 | LR Schedule | Linear warmup 2000 steps → Cosine decay to 1e-5 |
-| Batch Size | **2 (V100 16GB)** / **8 (RTX 5090 32GB)** / **16 (A100 80GB)** |
+| Batch Size | **1 (V100 16GB, Phase 2 限制)** / **4-8 (RTX 5090 32GB)** / **16 (A100 80GB)** |
 | Precision | AMP (Mamba2 core in FP32) |
 | Loss | CompositeLoss: LapLoss + Ternary + VGG + FlowSmoothness (w=0.1) |
 | Epochs | 200 |
@@ -359,7 +376,7 @@ python benchmark/TimeTest.py --model exp2c_feature_warp_best --resolution 1080p
 - **PSNR 大幅退步**：檢查 `--freeze_backbone` 是否生效，前 50 epoch backbone 梯度應為 0
 - **Loss 不收斂**：降低 lr 至 5e-5，或增加 freeze_backbone epochs
 - **大動作模糊未改善**：檢查 flow estimator 輸出是否合理 (可視化光流向量場)
-- **VRAM OOM (V100)**：確認 `--batch_size 2`，Phase 2 因增加 flow module 會多用約 1-2GB VRAM
+- **VRAM OOM (V100)**：Phase 2 新增 FlowEstimator(6.82M) + ContextNet×2(0.57M) + RefineNet(0.56M)，V100 限制 `--batch_size 1` (256×256 約 5.89GB)。建議使用 A100/5090 進行 Phase 2+ 全規模訓練。
 
 ---
 

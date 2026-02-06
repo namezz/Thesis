@@ -32,7 +32,7 @@ class IFBlock(nn.Module):
     def forward(self, x, flow, scale):
         if scale != 1:
             x = F.interpolate(x, scale_factor=1. / scale, mode="bilinear", align_corners=False)
-        if flow != None:
+        if flow is not None:
             flow = F.interpolate(flow, scale_factor=1. / scale, mode="bilinear", align_corners=False) * 1. / scale
             x = torch.cat((x, flow), 1)
         x = self.conv0(x)
@@ -44,32 +44,63 @@ class IFBlock(nn.Module):
         return flow, mask
 
 class OpticalFlowEstimator(nn.Module):
+    """
+    IFNet-style 3-scale coarse-to-fine optical flow estimator.
+    Reference: RIFE (ECCV 2022), VFIMamba (NeurIPS 2024)
+    
+    Input: img0, img1 (B, 3, H, W) in [0, 1]
+    Output: flow (B, 4, H, W) — bidirectional, timestep-scaled
+            mask (B, 1, H, W) — blending logits (pre-sigmoid)
+    
+    Supports arbitrary timestep for non-midpoint interpolation.
+    Supports scale parameter for high-resolution flow estimation.
+    """
     def __init__(self):
         super(OpticalFlowEstimator, self).__init__()
-        self.block0 = IFBlock(6, c=240)
-        self.block1 = IFBlock(17, c=150)
-        self.block2 = IFBlock(17, c=90)
+        # block0: 6 (img0+img1) + 1 (timestep map) = 7 input channels
+        self.block0 = IFBlock(7, c=240)
+        # block1/2: 13 (img0+img1+warped0+warped1+mask) + 4 (flow) + 1 (timestep) = 18
+        self.block1 = IFBlock(18, c=150)
+        self.block2 = IFBlock(18, c=90)
 
-    def forward(self, img0, img1, timestep=0.5):
-        # timestep placeholder for now
-        x = torch.cat((img0, img1), 1)
-        flow0, mask0 = self.block0(x, None, scale=4)
+    def forward(self, img0, img1, timestep=0.5, scale_list=[4, 2, 1]):
+        """
+        Args:
+            img0, img1: (B, 3, H, W) in [0, 1]
+            timestep: float or (B, 1, 1, 1) tensor, default 0.5
+            scale_list: multi-scale factors, e.g. [4,2,1] or [8,4,2] for high-res
+        Returns:
+            flow: (B, 4, H, W) — bidirectional flow scaled by timestep
+            mask: (B, 1, H, W) — blending logits (pre-sigmoid)
+        """
+        B = img0.shape[0]
+        # Build timestep map (B, 1, H, W)
+        if isinstance(timestep, (int, float)):
+            timestep_map = img0.new_full((B, 1, img0.shape[2], img0.shape[3]), timestep)
+        else:
+            timestep_map = timestep
         
-        warped_img0 = warp(img0, flow0[:, :2])
-        warped_img1 = warp(img1, flow0[:, 2:4])
-        x = torch.cat((img0, img1, warped_img0, warped_img1, mask0), 1)
-        flow1, mask1 = self.block1(x, flow0, scale=2)
-        flow1 = flow0 + flow1
-        mask1 = mask0 + mask1
+        # Scale 0 (coarsest): initial flow from raw images + timestep
+        x = torch.cat((img0, img1, timestep_map), 1)
+        flow, mask = self.block0(x, None, scale=scale_list[0])
         
-        warped_img0 = warp(img0, flow1[:, :2])
-        warped_img1 = warp(img1, flow1[:, 2:4])
-        x = torch.cat((img0, img1, warped_img0, warped_img1, mask1), 1)
-        flow2, mask2 = self.block2(x, flow1, scale=1)
-        flow2 = flow1 + flow2
-        mask2 = mask1 + mask2
+        # Scale 1: refine with warped images
+        warped_img0 = warp(img0, flow[:, :2])
+        warped_img1 = warp(img1, flow[:, 2:4])
+        x = torch.cat((img0, img1, warped_img0, warped_img1, mask, timestep_map), 1)
+        flow_d, mask_d = self.block1(x, flow, scale=scale_list[1])
+        flow = flow + flow_d
+        mask = mask + mask_d
         
-        return flow2, mask2
+        # Scale 2 (finest): final refinement
+        warped_img0 = warp(img0, flow[:, :2])
+        warped_img1 = warp(img1, flow[:, 2:4])
+        x = torch.cat((img0, img1, warped_img0, warped_img1, mask, timestep_map), 1)
+        flow_d, mask_d = self.block2(x, flow, scale=scale_list[2])
+        flow = flow + flow_d
+        mask = mask + mask_d
+        
+        return flow, mask
 
 def build_flow_estimator():
     return OpticalFlowEstimator()

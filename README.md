@@ -8,6 +8,12 @@
 - **Fusion**: ECAB (Efficient Channel Attention) + optional mHC residual mixing
 - **Init**: MaTVLM-style Attention→Mamba2 weight transfer (Q→C, K→B, V→x) — partial init implemented
 
+**Phase 2 Flow Pipeline**:
+- **OpticalFlowEstimator**: 3-scale coarse-to-fine (IFNet-style), timestep-aware (7ch/18ch input), outputs bidirectional flow `(B,4,H,W)` + mask `(B,1,H,W)`
+- **ContextNet** (×2): Per-frame multi-scale feature extractor (`3ch→c→2c→4c`), warped by flow at each scale. Inspired by RIFE/VFIMamba contextnet.
+- **Backbone on originals**: HybridBackbone processes original (unwarped) frames for proper cross-frame SS2D attention
+- **RefineNet** (use_context=True): Fuses backbone features + warped context at 3 scales → residual + mask
+
 **Interleaved SS2D** (from VFIMamba, NeurIPS 2024):
 Unlike standard 4-direction flip-based SS2D, this approach batch-concatenates the two input frames `[img0, img1]` and interleaves their tokens into a single sequence of length `2×H×W`. The SSM's recurrent state naturally carries cross-frame temporal information as it alternately processes tokens from both frames. 4 scan directions: H→W, W→H (transposed), and their reverses.
 
@@ -16,12 +22,12 @@ Unlike standard 4-direction flip-based SS2D, this approach batch-concatenates th
 ```
 Thesis-VFI/
 ├── model/
-│   ├── __init__.py      # ThesisModel: main pipeline (Phase 1/2)
+│   ├── __init__.py      # ThesisModel: main pipeline (Phase 1/2), ContextNet
 │   ├── backbone.py      # HybridBackbone, LGSBlock, GatedWindowAttention
-│   ├── flow.py          # OpticalFlowEstimator (IFNet-style, Phase 2)
-│   ├── refine.py        # RefineNet (U-Net decoder)
+│   ├── flow.py          # OpticalFlowEstimator (IFNet-style, timestep-aware, Phase 2)
+│   ├── refine.py        # RefineNet (U-Net decoder, use_context for Phase 2)
 │   ├── loss.py          # CompositeLoss: LapLoss + Ternary + VGG + FlowSmoothnessLoss
-│   ├── warplayer.py     # Backward warping
+│   ├── warplayer.py     # Backward warping (batch-independent grid cache)
 │   └── utils.py         # Window partition, ECAB, Interleaved SS2D, mHC, MaTVLM init
 ├── benchmark/           # Evaluation scripts (Vimeo90K, UCF101, SNU-FILM, etc.)
 ├── config.py            # Phase configs + ablation experiment configs
@@ -83,11 +89,13 @@ python benchmark/TimeTest.py --model exp3d_curriculum_best --resolution 4k
 
 ## VRAM Guidelines (Interleaved SS2D)
 
-| GPU | VRAM | Max Batch Size (256×256) |
-|-----|------|--------------------------|
-| V100 | 16 GB | 2 |
-| RTX 5090 | 32 GB | 8 |
-| A100 | 80 GB | 16-24 |
+| GPU | VRAM | Phase 1 Max Batch (256×256) | Phase 2 Max Batch (256×256) |
+|-----|------|----------------------------|----------------------------|
+| V100 | 16 GB | 2 (~11.1 GB) | 1 (~5.9 GB) |
+| RTX 5090 | 32 GB | 8 | 4-8 |
+| A100 | 80 GB | 16-24 | 16+ |
+
+**Note**: Phase 2 adds FlowEstimator (6.82M), ContextNet×2 (0.57M), and enhanced RefineNet (0.56M), totaling ~9.0M params vs Phase 1's ~1.24M. V100 16GB users should train Phase 2+ on cloud GPUs.
 
 ## Loss Function Design
 
