@@ -20,7 +20,7 @@ Thesis-VFI/
 │   ├── backbone.py      # HybridBackbone, LGSBlock, GatedWindowAttention
 │   ├── flow.py          # OpticalFlowEstimator (IFNet-style, Phase 2)
 │   ├── refine.py        # RefineNet (U-Net decoder)
-│   ├── loss.py          # LapLoss, VGGPerceptualLoss, Charbonnier
+│   ├── loss.py          # CompositeLoss: LapLoss + Ternary + VGG + FlowSmoothnessLoss
 │   ├── warplayer.py     # Backward warping
 │   └── utils.py         # Window partition, ECAB, Interleaved SS2D, mHC, MaTVLM init
 ├── benchmark/           # Evaluation scripts (Vimeo90K, UCF101, SNU-FILM, etc.)
@@ -88,6 +88,19 @@ python benchmark/TimeTest.py --model exp3d_curriculum_best --resolution 4k
 | V100 | 16 GB | 2 |
 | RTX 5090 | 32 GB | 8 |
 | A100 | 80 GB | 16-24 |
+
+## Loss Function Design
+
+**CompositeLoss** — phase-aware composite loss combining proven VFI losses:
+
+| Component | Weight | Phase | Source | Purpose |
+|-----------|--------|-------|--------|---------|
+| LapLoss | 1.0 | 1,2,3 | RIFE/VFIMamba/EMA-VFI | Multi-scale frequency L1 |
+| Ternary (Census) | 1.0 | 1,2,3 | RIFE/EMA-VFI/IFRNet | Local structural patterns (illumination-robust) |
+| VGG Perceptual | 0.005 | 1,2,3 | RIFE | Perceptual quality (conservative to avoid hallucination) |
+| FlowSmoothness | 0.1 | 2,3 | IFRNet-inspired | Edge-aware flow regularization |
+
+Each component is logged individually to TensorBoard (`loss/loss_lap`, `loss/loss_ter`, `loss/loss_vgg`, `loss/loss_flow_smooth`, `loss/loss_total`).
 
 ## Three-Phase Research Roadmap
 

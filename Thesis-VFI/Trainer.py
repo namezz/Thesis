@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from model import ThesisModel
-from model.loss import LapLoss, VGGPerceptualLoss
+from model.loss import CompositeLoss
 from config import MODEL_CONFIG
 
 class Model:
@@ -12,18 +12,21 @@ class Model:
         self.net = ThesisModel(MODEL_CONFIG['MODEL_ARCH'])
         self.name = MODEL_CONFIG['LOGNAME']
         self.device_id = local_rank
+
+        # Phase-aware composite loss
+        phase = MODEL_CONFIG.get('PHASE', 1)
+        self.loss_fn = CompositeLoss(phase=phase)
+
+        # Move everything to GPU
         self.device()
 
         # train
         self.optimG = AdamW(self.net.parameters(), lr=2e-4, weight_decay=1e-4)
-        self.lap_loss = LapLoss()
-        self.vgg_loss = VGGPerceptualLoss()
         
         # AMP
         self.scaler = torch.amp.GradScaler('cuda')
         
         if local_rank != -1:
-            # find_unused_parameters=True is needed for conditional architecture (ablation modes)
             self.net = DDP(self.net, device_ids=[local_rank], output_device=local_rank, 
                           find_unused_parameters=True)
 
@@ -36,8 +39,7 @@ class Model:
     def device(self):
         dev = torch.device("cuda", self.device_id) if self.device_id != -1 else torch.device("cuda")
         self.net.to(dev)
-        if hasattr(self, 'lap_loss'): self.lap_loss.to(dev)
-        if hasattr(self, 'vgg_loss'): self.vgg_loss.to(dev)
+        if hasattr(self, 'loss_fn'): self.loss_fn.to(dev)
 
     def load_model(self, name=None, rank=0):
         if rank <= 0 :
@@ -103,21 +105,20 @@ class Model:
         if training:
             self.train()
             x = torch.cat(imgs, dim=1) if isinstance(imgs, list) else imgs
+            img0 = x[:, :3]
             
             with torch.amp.autocast('cuda'):
-                pred = self.net(x)
-                loss_lap = self.lap_loss(pred, gt)
-                loss_vgg = self.vgg_loss(pred, gt)
-                loss_total = loss_lap + 0.01 * loss_vgg
+                pred, flow = self.net(x)
+                loss_total, loss_dict = self.loss_fn(pred, gt, flow=flow, img0=img0)
             
             self.optimG.zero_grad()
             self.scaler.scale(loss_total).backward()
             self.scaler.step(self.optimG)
             self.scaler.update()
-            return pred, loss_total
+            return pred, loss_dict
         else: 
             self.eval()
             with torch.no_grad():
                 x = torch.cat(imgs, dim=1) if isinstance(imgs, list) else imgs
-                pred = self.net(x)
-                return pred, 0
+                pred, _ = self.net(x)
+                return pred, {}

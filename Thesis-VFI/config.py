@@ -34,6 +34,7 @@ def init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid', use_mh
 
 PHASE1_CONFIG = {
     'LOGNAME': 'phase1_hybrid',
+    'PHASE': 1,
     'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'), 'use_flow': False},
     'USE_FLOW': False,
     'USE_X4K_TRAINING': False,
@@ -41,6 +42,7 @@ PHASE1_CONFIG = {
 
 PHASE2_CONFIG = {
     'LOGNAME': 'phase2_flow',
+    'PHASE': 2,
     'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'), 'use_flow': True},
     'USE_FLOW': True,
     'USE_X4K_TRAINING': False,
@@ -48,6 +50,7 @@ PHASE2_CONFIG = {
 
 PHASE3_CONFIG = {
     'LOGNAME': 'phase3_4k',
+    'PHASE': 3,
     'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'), 'use_flow': True},
     'USE_FLOW': True,
     'USE_X4K_TRAINING': True,

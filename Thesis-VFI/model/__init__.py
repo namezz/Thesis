@@ -39,7 +39,9 @@ class ThesisModel(nn.Module):
             mask = torch.sigmoid(flow_mask + refine_mask)
             merged = warped_img0 * mask + warped_img1 * (1 - mask)
             pred = merged + res
-            return torch.clamp(pred, 0, 1)
+            pred = torch.clamp(pred, 0, 1)
+            # Return flow for flow smoothness loss
+            return pred, flow
         else:
             # Phase 1: Backbone only (Direct Regression)
             feats = self.backbone(img0, img1)
@@ -48,7 +50,8 @@ class ThesisModel(nn.Module):
             # Learned mask blending of original frames + residual refinement
             merged = img0 * mask + img1 * (1 - mask)
             pred = merged + res
-            return torch.clamp(pred, 0, 1)
+            pred = torch.clamp(pred, 0, 1)
+            return pred, None
 
     def inference(self, img0, img1, TTA=False, scale=1.0, timestep=0.5, fast_TTA=False):
         """
@@ -79,7 +82,8 @@ class ThesisModel(nn.Module):
             
         def _infer(i0, i1):
             x = torch.cat((i0, i1), 1)
-            return self.forward(x, timestep)
+            pred, _ = self.forward(x, timestep)
+            return pred
 
         if TTA:
             if fast_TTA:

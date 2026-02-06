@@ -99,17 +99,18 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
             imgs = imgs.to(device, non_blocking=True) / 255.
             imgs, gt = imgs[:, 0:6], imgs[:, 6:]
             learning_rate = get_learning_rate(step, step_per_epoch, total_epochs, base_lr=lr)
-            _, loss = model.update(imgs, gt, learning_rate, training=True)
+            _, loss_dict = model.update(imgs, gt, learning_rate, training=True)
             train_time_interval = time.time() - time_stamp
             time_stamp = time.time()
             
             if step % 200 == 1 and local_rank == 0:
                 writer.add_scalar('learning_rate', learning_rate, step)
-                writer.add_scalar('loss', loss, step)
+                for k, v in loss_dict.items():
+                    writer.add_scalar(f'loss/{k}', v, step)
             
             # Update tqdm postfix instead of print
             if local_rank == 0:
-                pbar.set_postfix({'loss': f'{loss:.4e}', 'lr': f'{learning_rate:.2e}'})
+                pbar.set_postfix({'loss': f'{loss_dict.get("loss_total", 0):.4e}', 'lr': f'{learning_rate:.2e}'})
                 
             step += 1
         nr_eval += 1

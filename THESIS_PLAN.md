@@ -102,7 +102,7 @@ I_0, I_1 --[batch concat]--> CNN Stem (3ch) --> Multi-scale LGS Backbone -->
 | Batch Size | **2 (V100 16GB)** / **8 (RTX 5090 32GB)** / **16-24 (A100 80GB)** |
 | Hardware | **1x V100 16GB (dev)** / **A100 80GB or RTX 5090 32GB (train)** |
 | Precision | AMP (Mamba2 core in FP32 — Triton SSD kernel 不支援 FP16) |
-| Loss | Laplacian Pyramid L1 + 0.01 × VGG Perceptual |
+| Loss | CompositeLoss: LapLoss (w=1.0) + Ternary (w=1.0) + VGG (w=0.005) |
 | Epochs | 300 |
 
 #### 4.1.4 訓練指令
@@ -242,7 +242,7 @@ features --> RefineNet --> residual + refine_mask
 | LR Schedule | Linear warmup 2000 steps → Cosine decay to 1e-5 |
 | Batch Size | **2 (V100 16GB)** / **8 (RTX 5090 32GB)** / **16 (A100 80GB)** |
 | Precision | AMP (Mamba2 core in FP32) |
-| Loss | Laplacian Pyramid L1 + 0.01 × VGG Perceptual |
+| Loss | CompositeLoss: LapLoss + Ternary + VGG + FlowSmoothness (w=0.1) |
 | Epochs | 200 |
 | Backbone Freeze | 前 50 epochs 凍結 backbone，之後全模型微調 |
 | 初始化 | 從 Phase 1 最佳 checkpoint (`phase1_hybrid_best.pkl`) 載入 |
@@ -396,7 +396,7 @@ I_0, I_1 (3840×2160) --> scale=0.25 --> flow estimation at 960×540
 | LR Schedule | Linear warmup 2000 steps → Cosine decay to 5e-6 |
 | Batch Size | **2 (V100 16GB)** / **4-8 (RTX 5090 32GB)** / **8-16 (A100 80GB)** |
 | Precision | AMP (Mamba2 core in FP32) |
-| Loss | Laplacian Pyramid L1 + 0.01 × VGG Perceptual |
+| Loss | CompositeLoss: LapLoss + Ternary + VGG + FlowSmoothness (w=0.1) |
 | Epochs | 100 (Curriculum: 33+33+34) |
 | Curriculum | 256→384→512, transition T=33 |
 | 初始化 | 從 Phase 2 最佳 checkpoint (`exp2c_feature_warp_best.pkl`) 載入 |
@@ -620,9 +620,72 @@ print(f'FLOPs: {flops/1e9:.2f}G, Params: {params/1e6:.2f}M')
 
 ---
 
-## 5. 超參數調優策略 (Hyperparameter Tuning with Optuna)
+## 5. 損失函式策略 (Loss Function Strategy)
 
-### 5.1 調優時機建議
+### 5.1 設計理念
+
+根據對所有參考 VFI 專案的損失函式分析，本專案採用 **CompositeLoss** — 一個階段感知的複合損失，根據訓練階段自動組合不同的損失組件。
+
+**參考分析**：
+
+| 專案 | 使用的 Loss | 關鍵發現 |
+| :--- | :--- | :--- |
+| RIFE | LapLoss + Ternary + VGG + flow distill | 三大主流 loss 齊全 + teacher-student |
+| EMA-VFI | LapLoss + Ternary | 最簡潔，效果不差 |
+| IFRNet | Charbonnier + Ternary + Geometry + flow supervision | Ternary 在 3/4 的 SOTA VFI 中使用 |
+| VFIMamba | LapLoss only | 僅靠架構，loss 最簡 |
+
+**關鍵發現**：Ternary (Census) Loss 被 RIFE、EMA-VFI、IFRNet 三個頂級 VFI 方法採用，但之前我們的實作雖然有 Ternary 類別，卻**從未在訓練中使用過**。
+
+### 5.2 CompositeLoss 組成
+
+```python
+CompositeLoss(phase=N, w_lap=1.0, w_ter=1.0, w_vgg=0.005, w_flow_smooth=0.1)
+```
+
+| 組件 | 權重 | 階段 | 來源 | 說明 |
+| :--- | :--- | :--- | :--- | :--- |
+| **LapLoss** | 1.0 | 1, 2, 3 | RIFE/VFIMamba/EMA-VFI | 多尺度頻率分解 L1，VFI 標準 |
+| **Ternary** | 1.0 | 1, 2, 3 | RIFE/EMA-VFI/IFRNet | 捕捉局部結構模式，對光照變化魯棒 |
+| **VGG Perceptual** | 0.005 | 1, 2, 3 | RIFE | 感知品質，權重保守以避免幻影偽影 |
+| **FlowSmoothness** | 0.1 | 2, 3 | IFRNet inspired | 邊緣感知光流正則化 (edge-aware) |
+
+### 5.3 各階段損失組態
+
+- **Phase 1** (Backbone Only): `L_total = 1.0×LapLoss + 1.0×Ternary + 0.005×VGG`
+  - 不含 flow，純粹驗證 backbone 品質
+- **Phase 2** (Flow Guidance): `L_total = 1.0×LapLoss + 1.0×Ternary + 0.005×VGG + 0.1×FlowSmooth`
+  - 新增 FlowSmoothnessLoss，防止光流雜訊並允許邊界清晰
+- **Phase 3** (4K Fine-tune): 同 Phase 2
+  - 保持相同 loss 配比，專注於解析度提升
+
+### 5.4 技術細節
+
+- **Ternary AMP 相容性**：使用 `register_buffer('w', ...)` 而非建構子 `device` 參數。AMP 下輸入為 FP16 時，以 `.to(dtype=tensor_.dtype)` 確保 conv2d 核型別匹配。
+- **FlowSmoothnessLoss**：使用影像梯度作為邊緣權重 `exp(-|∇img|)`，在物體邊緣處允許光流不連續，平坦區域則鼓勵平滑。
+- **TensorBoard 記錄**：每個 loss 組件獨立記錄 (`loss/loss_lap`, `loss/loss_ter`, `loss/loss_vgg`, `loss/loss_flow_smooth`, `loss/loss_total`)，便於分析各組件貢獻。
+- **Model Forward**：`ThesisModel.forward()` 回傳 `(pred, flow)` 或 `(pred, None)`，使 Trainer 能將 flow 傳遞給 FlowSmoothnessLoss。
+
+### 5.5 損失函式消融實驗 (建議)
+
+- **Exp-1j**: Loss 組件消融 — 比較不同 loss 組合對 Phase 1 PSNR 的影響
+  - (a) LapLoss only (VFIMamba baseline)
+  - (b) LapLoss + VGG (原始設定)
+  - (c) LapLoss + Ternary (EMA-VFI 風格)
+  - (d) LapLoss + Ternary + VGG (本專案設定)
+  - 預期：(d) ≥ (c) > (b) > (a)
+
+### 5.6 潛在未來擴展
+
+- **Geometry Loss** (IFRNet): 在多尺度中間特徵上計算一致性損失，需要 backbone 輸出中間特徵
+- **Flow Distillation** (RIFE): 用預訓練的高精度光流模型 (如 FlowFormer++) 做 teacher-student 監督
+- **SSIM Loss**: 直接最大化結構相似性指標
+
+---
+
+## 6. 超參數調優策略 (Hyperparameter Tuning with Optuna)
+
+### 6.1 調優時機建議
 
 **強烈建議先通過 Phase 1 Baseline 再進行超參數搜索。** 理由如下：
 
@@ -633,12 +696,12 @@ print(f'FLOPs: {flops/1e9:.2f}G, Params: {params/1e6:.2f}M')
 **建議流程**：
 ```
 Phase 1 Baseline (default params, 300 epochs)
-    ├── PSNR ≥ 35.0 ──→ ✅ 進入 Optuna 搜索 (§5.3)
+    ├── PSNR ≥ 35.0 ──→ ✅ 進入 Optuna 搜索 (§6.3)
     ├── 33.0 ≤ PSNR < 35.0 ──→ ⚠️ 先手動檢查 loss curve、梯度、lr
     └── PSNR < 33.0 ──→ ❌ 架構/程式碼有 bug，先除錯
 ```
 
-### 5.2 Optuna 搜索空間 (Search Space)
+### 6.2 Optuna 搜索空間 (Search Space)
 
 | 超參數 | 搜索範圍 | 類型 | 說明 |
 | :--- | :--- | :--- | :--- |
@@ -647,12 +710,13 @@ Phase 1 Baseline (default params, 300 epochs)
 | `weight_decay` | `[1e-5, 1e-3]` | log-uniform | AdamW 正則化 |
 | `warmup_steps` | `[500, 5000]` | int | 線性 warmup 步數 |
 | `loss_vgg_weight` | `[0.001, 0.1]` | log-uniform | VGG perceptual loss 權重 |
+| `loss_ter_weight` | `[0.1, 2.0]` | log-uniform | Ternary census loss 權重 |
 | `window_size` | `{7, 8}` | categorical | Gated Attention 窗口大小 |
 | `use_ecab` | `{True, False}` | boolean | ECAB vs CAB |
 | `use_mhc` | `{True, False}` | boolean | mHC 殘差混合 |
 | `min_lr_ratio` | `[0.01, 0.2]` | float | Cosine decay 最終 lr / base lr |
 
-### 5.3 Optuna 執行策略
+### 6.3 Optuna 執行策略
 
 ```python
 # optuna_search.py (Phase 1 範例)
@@ -688,7 +752,7 @@ study = optuna.create_study(
 study.optimize(objective, n_trials=30)
 ```
 
-### 5.4 結果記錄與分析
+### 6.4 結果記錄與分析
 
 所有 Optuna trial 結果會自動存入 SQLite DB (`optuna_phase1.db`)，可用以下方式查閱：
 
@@ -709,7 +773,7 @@ df.to_csv('optuna_phase1_results.csv', index=False)
 "
 ```
 
-### 5.5 各 Phase 調優建議
+### 6.5 各 Phase 調優建議
 
 | Phase | 調優時機 | 搜索重點 | Trial 數 | Epoch/trial |
 | :--- | :--- | :--- | :--- | :--- |
@@ -721,7 +785,7 @@ df.to_csv('optuna_phase1_results.csv', index=False)
 
 ---
 
-## 6. 參考文獻 (Key References)
+## 7. 參考文獻 (Key References)
 
 | 技術 | 論文 | 引用 |
 | :--- | :--- | :--- |
@@ -737,5 +801,5 @@ df.to_csv('optuna_phase1_results.csv', index=False)
 
 ---
 
-*文件更新日期：2026-02-06*
-*版次：v8.0 (新增 §5 Optuna 超參數調優策略, benchmark bug fixes, SSIM 評估, dataset 強健性修正)*
+*文件更新日期：2026-02-07*
+*版次：v9.0 (新增 §5 損失函式策略, CompositeLoss 階段感知設計, Ternary/FlowSmoothness 整合, TensorBoard 逐組件記錄)*

@@ -3,6 +3,10 @@ import torch.nn as nn
 import numpy as np 
 import torch.nn.functional as F
 
+# ============================================================
+# Laplacian Pyramid Loss (RIFE / VFIMamba / EMA-VFI standard)
+# ============================================================
+
 def gauss_kernel(channels=3, device=None):
     kernel = torch.tensor([[1., 4., 6., 4., 1],
                            [4., 16., 24., 16., 4.],
@@ -46,6 +50,22 @@ def laplacian_pyramid(img, kernel, max_levels=3):
         current = down
     return pyr
 
+class LapLoss(torch.nn.Module):
+    def __init__(self, max_levels=5, channels=3):
+        super(LapLoss, self).__init__()
+        self.max_levels = max_levels
+        self.channels = channels
+        
+    def forward(self, input, target):
+        kernel = gauss_kernel(channels=self.channels, device=input.device)
+        pyr_input  = laplacian_pyramid(img=input, kernel=kernel, max_levels=self.max_levels)
+        pyr_target = laplacian_pyramid(img=target, kernel=kernel, max_levels=self.max_levels)
+        return sum(torch.nn.functional.l1_loss(a, b) for a, b in zip(pyr_input, pyr_target))
+
+# ============================================================
+# VGG Perceptual Loss (multi-layer feature matching)
+# ============================================================
+
 class VGGPerceptualLoss(nn.Module):
     def __init__(self):
         super(VGGPerceptualLoss, self).__init__()
@@ -85,58 +105,50 @@ class VGGPerceptualLoss(nn.Module):
         loss = F.l1_loss(h1, h1_target) + F.l1_loss(h2, h2_target) + F.l1_loss(h3, h3_target)
         return loss
 
-class LapLoss(torch.nn.Module):
-    def __init__(self, max_levels=5, channels=3):
-        super(LapLoss, self).__init__()
-        self.max_levels = max_levels
-        self.channels = channels
-        
-    def forward(self, input, target):
-        kernel = gauss_kernel(channels=self.channels, device=input.device)
-        pyr_input  = laplacian_pyramid(img=input, kernel=kernel, max_levels=self.max_levels)
-        pyr_target = laplacian_pyramid(img=target, kernel=kernel, max_levels=self.max_levels)
-        return sum(torch.nn.functional.l1_loss(a, b) for a, b in zip(pyr_input, pyr_target))
+# ============================================================
+# Ternary (Census) Loss — device-agnostic version
+# Used by: RIFE, EMA-VFI, IFRNet (proven effective for VFI)
+# Captures local structural patterns robust to illumination changes
+# ============================================================
 
 class Ternary(nn.Module):
-    def __init__(self, device):
+    def __init__(self, patch_size=7):
         super(Ternary, self).__init__()
-        patch_size = 7
+        self.patch_size = patch_size
         out_channels = patch_size * patch_size
-        self.w = np.eye(out_channels).reshape(
-            (patch_size, patch_size, 1, out_channels))
-        self.w = np.transpose(self.w, (3, 2, 0, 1))
-        self.w = torch.tensor(self.w).float().to(device)
+        w = np.eye(out_channels).reshape((patch_size, patch_size, 1, out_channels))
+        w = np.transpose(w, (3, 2, 0, 1))
+        self.register_buffer('w', torch.tensor(w).float())
 
-    def transform(self, img):
-        patches = F.conv2d(img, self.w, padding=3, bias=None)
-        transf = patches - img
-        transf_norm = transf / torch.sqrt(0.81 + transf**2)
-        return transf_norm
+    def transform(self, tensor):
+        tensor_ = tensor.mean(dim=1, keepdim=True)
+        w = self.w.to(dtype=tensor_.dtype)
+        patches = F.conv2d(tensor_, w, padding=self.patch_size // 2, bias=None)
+        loc_diff = patches - tensor_
+        loc_diff_norm = loc_diff / torch.sqrt(0.81 + loc_diff ** 2)
+        return loc_diff_norm
 
-    def rgb2gray(self, rgb):
-        r, g, b = rgb[:, 0:1, :, :], rgb[:, 1:2, :, :], rgb[:, 2:3, :, :]
-        gray = 0.2989 * r + 0.5870 * g + 0.1140 * b
-        return gray
-
-    def hamming(self, t1, t2):
-        dist = (t1 - t2) ** 2
-        dist_norm = torch.mean(dist / (0.1 + dist), 1, True)
-        return dist_norm
-
-    def valid_mask(self, t, padding):
-        n, _, h, w = t.size()
-        inner = torch.ones(n, 1, h - 2 * padding, w - 2 * padding).type_as(t)
+    def valid_mask(self, tensor):
+        padding = self.patch_size // 2
+        b, c, h, w = tensor.size()
+        inner = torch.ones(b, 1, h - 2 * padding, w - 2 * padding).type_as(tensor)
         mask = F.pad(inner, [padding] * 4)
         return mask
 
-    def forward(self, img0, img1):
-        img0 = self.transform(self.rgb2gray(img0))
-        img1 = self.transform(self.rgb2gray(img1))
-        return self.hamming(img0, img1) * self.valid_mask(img0, 1)
+    def forward(self, x, y):
+        loc_diff_x = self.transform(x)
+        loc_diff_y = self.transform(y)
+        diff = loc_diff_x - loc_diff_y.detach()
+        dist = (diff ** 2 / (0.1 + diff ** 2)).mean(dim=1, keepdim=True)
+        mask = self.valid_mask(x)
+        loss = (dist * mask).mean()
+        return loss
 
+# ============================================================
+# Charbonnier Loss (robust L1, used by IFRNet)
+# ============================================================
 
 class CharbonnierLoss(nn.Module):
-    """Charbonnier Loss (L1 variant, more robust than L1 near zero)"""
     def __init__(self, eps=1e-6):
         super(CharbonnierLoss, self).__init__()
         self.eps = eps
@@ -144,3 +156,86 @@ class CharbonnierLoss(nn.Module):
     def forward(self, pred, target):
         diff = pred - target
         return torch.mean(torch.sqrt(diff * diff + self.eps))
+
+# ============================================================
+# Flow Smoothness Loss — encourages spatial smoothness in flow
+# Edge-aware: weighted by image gradient to allow sharp flow at edges
+# ============================================================
+
+class FlowSmoothnessLoss(nn.Module):
+    """Edge-aware flow smoothness regularization for Phase 2+."""
+    def forward(self, flow, img):
+        # Image gradient for edge-aware weighting
+        img_dx = torch.mean(torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:]), 1, keepdim=True)
+        img_dy = torch.mean(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :]), 1, keepdim=True)
+        weight_x = torch.exp(-img_dx)
+        weight_y = torch.exp(-img_dy)
+        
+        # Flow gradient
+        flow_dx = torch.abs(flow[:, :, :, :-1] - flow[:, :, :, 1:])
+        flow_dy = torch.abs(flow[:, :, :-1, :] - flow[:, :, 1:, :])
+        
+        loss = (weight_x * flow_dx).mean() + (weight_y * flow_dy).mean()
+        return loss
+
+# ============================================================
+# Composite Loss — phase-aware loss combination
+# ============================================================
+
+class CompositeLoss(nn.Module):
+    """
+    Phase-aware composite loss for VFI training.
+    
+    Phase 1: LapLoss + Ternary + VGG (backbone-only, no flow)
+    Phase 2: LapLoss + Ternary + VGG + FlowSmoothness (flow guidance)
+    Phase 3: Same as Phase 2 (4K fine-tune)
+    
+    Loss weights from reference implementations:
+    - LapLoss: 1.0 (primary, RIFE/VFIMamba/EMA-VFI standard)
+    - Ternary: 1.0 (proven in RIFE/IFRNet, captures structural similarity)
+    - VGG:    0.005 (perceptual quality, conservative weight to avoid hallucination)
+    - FlowSmooth: 0.1 (Phase 2+, edge-aware regularization)
+    """
+    def __init__(self, phase=1, w_lap=1.0, w_ter=1.0, w_vgg=0.005, w_flow_smooth=0.1):
+        super(CompositeLoss, self).__init__()
+        self.phase = phase
+        self.w_lap = w_lap
+        self.w_ter = w_ter
+        self.w_vgg = w_vgg
+        self.w_flow_smooth = w_flow_smooth
+        
+        self.lap_loss = LapLoss()
+        self.ternary_loss = Ternary()
+        self.vgg_loss = VGGPerceptualLoss()
+        if phase >= 2:
+            self.flow_smooth_loss = FlowSmoothnessLoss()
+    
+    def forward(self, pred, gt, flow=None, img0=None):
+        """
+        Args:
+            pred: predicted frame (B, 3, H, W)
+            gt: ground truth frame (B, 3, H, W)
+            flow: optical flow (B, 4, H, W) — only for Phase 2+
+            img0: input frame 0 (B, 3, H, W) — for edge-aware flow smoothness
+        Returns:
+            total_loss, loss_dict (for TensorBoard logging)
+        """
+        loss_lap = self.lap_loss(pred, gt)
+        loss_ter = self.ternary_loss(pred, gt)
+        loss_vgg = self.vgg_loss(pred, gt)
+        
+        total = self.w_lap * loss_lap + self.w_ter * loss_ter + self.w_vgg * loss_vgg
+        
+        loss_dict = {
+            'loss_lap': loss_lap.item(),
+            'loss_ter': loss_ter.item(),
+            'loss_vgg': loss_vgg.item(),
+        }
+        
+        if self.phase >= 2 and flow is not None and img0 is not None:
+            loss_flow_smooth = self.flow_smooth_loss(flow, img0)
+            total = total + self.w_flow_smooth * loss_flow_smooth
+            loss_dict['loss_flow_smooth'] = loss_flow_smooth.item()
+        
+        loss_dict['loss_total'] = total.item()
+        return total, loss_dict
