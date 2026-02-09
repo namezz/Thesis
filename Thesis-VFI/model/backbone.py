@@ -17,7 +17,18 @@ class GatedWindowAttention(nn.Module):
     """
     Window based multi-head self-attention (W-MSA) with gating mechanism.
     Ref: Gated Attention (arXiv:2505.06708, Qiu et al., Qwen Team, 2025)
-    Uses FlashAttention-2 via F.scaled_dot_product_attention.
+    
+    Backend selection for F.scaled_dot_product_attention:
+    - RTX 5090 (SM 12.0 Blackwell): FlashAttention-2 via PyTorch SDPA (cuDNN backend).
+      FlashAttention-3/FA4 is Hopper-only (SM 9.0); FA4-CuTe for SM100 is in development
+      but requires the flash-attn package's `cute` module. PyTorch SDPA auto-selects
+      the best available kernel (FlashAttention-2 or cuDNN) on Blackwell.
+    - A100 (SM 8.0): FlashAttention-2 via PyTorch SDPA.
+    - V100 (SM 7.0): Falls back to math backend (no FlashAttention support).
+    
+    NOTE: When attn_mask is provided (shifted window attention), PyTorch SDPA cannot use
+    the FlashAttention kernel and falls back to the math or mem-efficient backend.
+    We optimize this by using is_causal=False without mask when shift_size=0.
     """
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
@@ -43,17 +54,16 @@ class GatedWindowAttention(nn.Module):
 
         attn_mask = mask
         if mask is not None:
-            # mask shape: (nW, N, N) where nW is number of windows
-            # B_ = BatchSize * nW
             nW = mask.shape[0]
-            # Expand mask to (BatchSize*nW, 1, N, N) to match q, k, v batch dim
-            # We repeat the mask for each image in the batch
-            attn_mask = mask.unsqueeze(1).unsqueeze(0) # (1, nW, 1, N, N)
-            attn_mask = attn_mask.repeat(B_ // nW, 1, 1, 1, 1) # (B, nW, 1, N, N)
-            attn_mask = attn_mask.view(-1, 1, N, N) # (B_, 1, N, N)
+            attn_mask = mask.unsqueeze(1).unsqueeze(0)
+            attn_mask = attn_mask.repeat(B_ // nW, 1, 1, 1, 1)
+            attn_mask = attn_mask.view(-1, 1, N, N)
 
-        # FlashAttention-2 (Scaled Dot Product Attention)
-        # dropout_p is handled internally. mask can be additive or boolean.
+        # F.scaled_dot_product_attention auto-selects the best backend:
+        # - No mask: uses FlashAttention-2 kernel (fastest, O(N) memory)
+        # - With mask: falls back to math/mem-efficient backend
+        # On RTX 5090 (Blackwell SM 12.0), PyTorch SDPA uses cuDNN-fused attention
+        # which is comparable to FlashAttention-2 performance.
         x_attn = F.scaled_dot_product_attention(
             q, k, v, 
             attn_mask=attn_mask, 

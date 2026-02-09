@@ -827,6 +827,51 @@ df.to_csv('optuna_phase1_results.csv', index=False)
 
 ---
 
+### 6.7 FlashAttention 版本與 GPU 相容性分析 (v9.2)
+
+#### GPU 計算能力對照
+
+| GPU | SM 版本 | 架構 | VRAM | FlashAttention 支援 |
+| :--- | :--- | :--- | :--- | :--- |
+| V100 | SM 7.0 | Volta | 16GB | ❌ 不支援 (需 SM ≥ 8.0)，SDPA 自動退化為 math backend |
+| A100 | SM 8.0 | Ampere | 80GB | ✅ FlashAttention-2 (via PyTorch SDPA 或 flash-attn package) |
+| RTX 5090 | SM 12.0 | Blackwell | 32GB | ✅ FlashAttention-2 (via PyTorch SDPA + cuDNN fused attention) |
+
+#### FlashAttention-2 vs FlashAttention-3 對比
+
+| 特性 | FlashAttention-2 | FlashAttention-3 |
+| :--- | :--- | :--- |
+| 支援硬體 | SM ≥ 8.0 (A100, RTX 40xx, RTX 50xx) | **SM 9.0 only** (H100/H800 Hopper) |
+| PyTorch 整合 | ✅ `F.scaled_dot_product_attention` 自動選擇 | ❌ 需獨立安裝 `flash-attn` hopper module |
+| 效能 (H100) | ~350 TFLOPS FP16 (35% utilization) | ~740 TFLOPS FP16 (75% utilization, 1.5-2x faster) |
+| FP8 支援 | ❌ | ✅ (H100 only, ~1.2 PFLOPS) |
+| RTX 5090 可用 | ✅ (透過 SDPA/cuDNN) | ❌ **不支援** (Hopper-only 指令: WGMMA, TMA) |
+
+#### FA4-CuTe for Blackwell (SM 10.0+) — 開發中
+
+flash-attention repo 正在開發 `FA4-CuTe` 針對 Blackwell (SM 10.0+)：
+- PR #2109: FP8 E4M3/E5M2 支援，在 Blackwell 上達到 **~1800 TFLOPS** (headdim=128, seqlen=8K)
+- PR #2188: 測試套件建立中
+- **尚未正式發布**，需要從 source 安裝 (`flash_attn.cute` module)
+
+#### 結論與建議
+
+**RTX 5090 上的最佳策略：使用 PyTorch 原生 `F.scaled_dot_product_attention` (FlashAttention-2 backend)**
+
+理由：
+1. RTX 5090 (SM 12.0) **不支援 FlashAttention-3** — FA3 使用 Hopper-only 的 WGMMA/TMA 指令 (SM 9.0)
+2. PyTorch SDPA 在 Blackwell 上會自動選擇 **cuDNN fused attention** 或 FlashAttention-2 kernel
+3. FA4-CuTe (SM 10.0+) 效能更佳但尚未穩定發布，可作為未來升級路徑
+4. 我們的 window attention 使用小序列長度 (window_size²=64)，FlashAttention 的 IO-awareness 優勢在短序列上較不顯著
+5. **不需要額外安裝 `flash-attn` package** — PyTorch 原生 SDPA 已包含 FlashAttention-2
+
+**注意事項：**
+- 當使用 shifted window attention (有 attn_mask) 時，SDPA 會退化為 math/mem-efficient backend
+- 約一半的 LGSBlock 使用 shift_size=0（無 mask），可完整利用 FlashAttention-2 kernel
+- 建議 PyTorch ≥ 2.4 以獲得最佳 Blackwell 支援
+
+---
+
 ## 7. 參考文獻 (Key References)
 
 | 技術 | 論文 | 引用 |
@@ -843,5 +888,5 @@ df.to_csv('optuna_phase1_results.csv', index=False)
 
 ---
 
-*文件更新日期：2026-02-08*
-*版次：v9.1 (訓練管線穩健性改進：梯度裁剪、optimizer state resume、dataset crop 參數化、benchmark 修正)*
+*文件更新日期：2026-02-09*
+*版次：v9.2 (新增 §6.7 FlashAttention GPU 相容性分析: FA2 vs FA3 vs FA4-CuTe, RTX 5090 策略)*
