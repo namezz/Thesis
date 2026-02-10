@@ -67,19 +67,24 @@ class Model:
                     if 'scaler' in optim_state:
                         self.scaler.load_state_dict(optim_state['scaler'])
                     print(f"  Loaded optimizer state from {optim_path}")
+                    return optim_state.get('train_state', None)
             else:
                 print(f"No checkpoint found at {path}, starting from scratch.")
+        return None
     
-    def save_model(self, rank=0, suffix=''):
+    def save_model(self, rank=0, suffix='', train_state=None):
         if rank == 0:
             # Save without 'module.' prefix for portability
             state_dict = self.net.module.state_dict() if hasattr(self.net, 'module') else self.net.state_dict()
             torch.save(state_dict, f'ckpt/{self.name}{suffix}.pkl')
-            # Save optimizer + scaler state for proper resume
-            torch.save({
+            # Save optimizer + scaler + training state for proper resume
+            optim_dict = {
                 'optimizer': self.optimG.state_dict(),
                 'scaler': self.scaler.state_dict(),
-            }, f'ckpt/{self.name}{suffix}_optim.pkl')
+            }
+            if train_state is not None:
+                optim_dict['train_state'] = train_state
+            torch.save(optim_dict, f'ckpt/{self.name}{suffix}_optim.pkl')
 
     @torch.no_grad()
     def inference(self, img0, img1, TTA=False, timestep=0.5, fast_TTA=False):

@@ -38,6 +38,20 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
     step = 0
     nr_eval = 0
     best_psnr_holder = {'val': 0.0}
+    start_epoch = 0
+    
+    # Resume training state from checkpoint if available
+    optim_path = f'ckpt/{MODEL_CONFIG["LOGNAME"]}_optim.pkl'
+    if os.path.exists(optim_path):
+        optim_ckpt = torch.load(optim_path, map_location='cpu', weights_only=True)
+        train_state = optim_ckpt.get('train_state', None)
+        if train_state is not None:
+            start_epoch = train_state.get('epoch', 0) + 1
+            step = train_state.get('step', 0)
+            nr_eval = train_state.get('nr_eval', 0)
+            best_psnr_holder['val'] = train_state.get('best_psnr', 0.0)
+            if local_rank == 0:
+                print(f"Resuming from epoch {start_epoch}, step {step}, best_psnr {best_psnr_holder['val']:.4f}")
     
     # Freeze backbone if requested
     if freeze_epochs > 0:
@@ -70,7 +84,7 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
         if grad_accum > 1:
             print(f'Gradient accumulation: {grad_accum} steps, effective batch = {batch_size * grad_accum}')
     time_stamp = time.time()
-    for epoch in range(total_epochs):
+    for epoch in range(start_epoch, total_epochs):
         # Unfreeze backbone after freeze_epochs
         if freeze_epochs > 0 and epoch == freeze_epochs:
             model.unfreeze_backbone()
@@ -132,7 +146,8 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
         nr_eval += 1
         if nr_eval % eval_interval == 0:
             evaluate(model, val_data, nr_eval, local_rank, writer_val=writer_val, best_psnr_holder=best_psnr_holder)
-        model.save_model(local_rank)    
+        train_state = {'epoch': epoch, 'step': step, 'nr_eval': nr_eval, 'best_psnr': best_psnr_holder['val']}
+        model.save_model(local_rank, train_state=train_state)    
         dist.barrier()
 
 def evaluate(model, val_data, nr_eval, local_rank, writer_val=None, best_psnr_holder=None):

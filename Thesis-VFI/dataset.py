@@ -156,9 +156,9 @@ class VimeoDataset(Dataset):
             self.is_septuplet = False
             
         with open(self.train_fn, 'r') as f:
-            self.trainlist = f.read().splitlines()
+            self.trainlist = [l for l in f.read().splitlines() if l.strip()]
         with open(self.test_fn, 'r') as f:
-            self.testlist = f.read().splitlines()                                                    
+            self.testlist = [l for l in f.read().splitlines() if l.strip()]
         self.load_data()
 
     def __len__(self):
