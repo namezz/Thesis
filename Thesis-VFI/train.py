@@ -191,7 +191,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=2e-4, help='Learning rate')
     parser.add_argument('--num_workers', type=int, default=8, help='DataLoader num_workers')
     parser.add_argument('--grad_accum', type=int, default=1, help='Gradient accumulation steps (effective batch = batch_size * grad_accum)')
-    parser.add_argument('--eval_interval', type=int, default=10, help='Evaluate every N epochs (default: 10)')
+    parser.add_argument('--eval_interval', type=int, default=3, help='Evaluate every N epochs (default: 3)')
     # Phase control
     parser.add_argument('--phase', type=int, default=1, choices=[1, 2, 3], help='Training phase (1/2/3)')
     # Ablation experiment control
