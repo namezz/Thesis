@@ -43,7 +43,7 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
     # Resume training state from checkpoint if available
     optim_path = f'ckpt/{MODEL_CONFIG["LOGNAME"]}_optim.pkl'
     if os.path.exists(optim_path):
-        optim_ckpt = torch.load(optim_path, map_location='cpu', weights_only=True)
+        optim_ckpt = torch.load(optim_path, map_location='cpu', weights_only=False)
         train_state = optim_ckpt.get('train_state', None)
         if train_state is not None:
             start_epoch = train_state.get('epoch', 0) + 1

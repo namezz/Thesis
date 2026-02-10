@@ -48,7 +48,7 @@ class Model:
             path = f'ckpt/{name}.pkl'
             if os.path.exists(path):
                 print(f"Loading model from {path}")
-                state_dict = torch.load(path, map_location='cpu', weights_only=True)
+                state_dict = torch.load(path, map_location='cpu', weights_only=False)
                 # Handle DDP 'module.' prefix mismatch
                 model_dict = self.net.state_dict()
                 has_module = any(k.startswith('module.') for k in model_dict.keys())
@@ -61,7 +61,7 @@ class Model:
                 # Load optimizer state if available
                 optim_path = f'ckpt/{name}_optim.pkl'
                 if os.path.exists(optim_path):
-                    optim_state = torch.load(optim_path, map_location='cpu', weights_only=True)
+                    optim_state = torch.load(optim_path, map_location='cpu', weights_only=False)
                     if 'optimizer' in optim_state:
                         self.optimG.load_state_dict(optim_state['optimizer'])
                     if 'scaler' in optim_state:
