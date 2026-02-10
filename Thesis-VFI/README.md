@@ -92,6 +92,33 @@ Current verified setup on RTX 5090:
 | mamba-ssm | 2.3.0 (source-compiled from `state-spaces/mamba`) |
 | causal-conv1d | 1.6.0 (source-compiled from `yacinemassena/causal-conv1d-sm120`) |
 
+### RTX 5090 (sm_120) Build Instructions
+
+RTX 5090 uses sm_120 (Blackwell), which requires PyTorch >= 2.8 and source-compiled
+mamba-ssm / causal-conv1d. Pre-built wheels do not support sm_120.
+
+```bash
+# 1. Create conda environment with PyTorch + CUDA 12.8
+conda create -n thesis python=3.11
+conda activate thesis
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# 2. Install build tools
+pip install ninja
+conda install -c nvidia cuda-toolkit=12.8
+
+# 3. Build causal-conv1d (sm_120 fork)
+git clone https://github.com/yacinemassena/causal-conv1d-sm120.git
+cd causal-conv1d-sm120 && pip install . && cd ..
+
+# 4. Build mamba-ssm from source
+git clone https://github.com/state-spaces/mamba.git
+cd mamba && pip install . && cd ..
+
+# 5. Verify
+python -c "from mamba_ssm import Mamba2; print('Mamba2 OK')"
+```
+
 ## Usage
 
 ### Training
@@ -135,6 +162,40 @@ python benchmark/TimeTest.py --model phase1_hybrid_v2_best --resolution 1080p
 ```bash
 python demo_2x.py --model phase1_hybrid_v2_best --video input.mp4 --scale 1.0
 ```
+
+### Ablation Experiments
+
+```bash
+# Mamba2-only (no attention)
+torchrun --nproc_per_node=1 train.py --phase 1 \
+    --exp_name exp1a_mamba2_only --backbone_mode mamba2_only \
+    --batch_size 4 --epochs 100 --data_path /josh/dataset/vimeo90k/vimeo_triplet
+
+# Gated Attention-only (no SSM)
+torchrun --nproc_per_node=1 train.py --phase 1 \
+    --exp_name exp1b_gated_attn_only --backbone_mode gated_attn_only \
+    --batch_size 4 --epochs 100 --data_path /josh/dataset/vimeo90k/vimeo_triplet
+
+# With mHC (Manifold Hyper-Connections)
+torchrun --nproc_per_node=1 train.py --phase 1 \
+    --exp_name exp1h_mhc --use_mhc \
+    --batch_size 4 --epochs 100 --data_path /josh/dataset/vimeo90k/vimeo_triplet
+```
+
+### Checkpoint Resume
+
+Checkpoints are saved automatically every epoch. To resume after a crash,
+simply re-run the same training command -- it loads the latest checkpoint automatically.
+
+## Datasets
+
+| Dataset | Path | Status |
+|---------|------|--------|
+| Vimeo90K Triplet | `/josh/dataset/vimeo90k/vimeo_triplet` | Ready (51,313 train / 3,782 test) |
+| UCF101 | `/josh/dataset/UCF101/ucf101_interp_ours` | Ready |
+| MiddleBury | `/josh/dataset/MiddleBury/other-data` | Ready |
+| SNU-FILM | `/josh/dataset/SNU-FILM` | Needs download |
+| X4K1000FPS | `/josh/dataset/X4K1000FPS` | Needs extraction |
 
 ## Benchmark Targets
 
