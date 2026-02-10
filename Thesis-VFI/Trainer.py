@@ -113,7 +113,7 @@ class Model:
             param.requires_grad = True
         print("Backbone parameters unfrozen.")
     
-    def update(self, imgs, gt, learning_rate=0, training=True):
+    def update(self, imgs, gt, learning_rate=0, training=True, accumulate=False):
         for param_group in self.optimG.param_groups:
             param_group['lr'] = learning_rate
         if training:
@@ -125,12 +125,14 @@ class Model:
                 pred, flow = self.net(x)
                 loss_total, loss_dict = self.loss_fn(pred, gt, flow=flow, img0=img0)
             
-            self.optimG.zero_grad()
+            if not accumulate:
+                self.optimG.zero_grad()
             self.scaler.scale(loss_total).backward()
-            self.scaler.unscale_(self.optimG)
-            torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
-            self.scaler.step(self.optimG)
-            self.scaler.update()
+            if not accumulate:
+                self.scaler.unscale_(self.optimG)
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimG)
+                self.scaler.update()
             return pred, loss_dict
         else: 
             self.eval()
@@ -138,3 +140,11 @@ class Model:
                 x = torch.cat(imgs, dim=1) if isinstance(imgs, list) else imgs
                 pred, _ = self.net(x)
                 return pred, {}
+
+    def accum_step(self):
+        """Perform optimizer step after gradient accumulation."""
+        self.scaler.unscale_(self.optimG)
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+        self.scaler.step(self.optimG)
+        self.scaler.update()
+        self.optimG.zero_grad()

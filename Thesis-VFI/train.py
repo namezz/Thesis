@@ -28,7 +28,7 @@ def get_learning_rate(step, step_per_epoch, total_epochs=300, base_lr=2e-4, min_
 
 from tqdm import tqdm
 
-def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(2, 1), freeze_epochs=0, total_epochs=300, curriculum=False, curriculum_T=50, crop_size=256, lr=2e-4):
+def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(2, 1), freeze_epochs=0, total_epochs=300, curriculum=False, curriculum_T=50, crop_size=256, lr=2e-4, num_workers=8, grad_accum=1, eval_interval=10):
     if local_rank == 0:
         writer = SummaryWriter(f'log/train_{MODEL_CONFIG["LOGNAME"]}')
         writer_val = SummaryWriter(f'log/validate_{MODEL_CONFIG["LOGNAME"]}')
@@ -59,13 +59,16 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
             print(f"Curriculum learning enabled: sizes={curriculum_sizes}, transition at epoch {curriculum_T}")
         
     sampler = DistributedSampler(dataset)
-    train_data = DataLoader(dataset, batch_size=batch_size, num_workers=4, pin_memory=True, drop_last=True, sampler=sampler)
+    train_data = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=True, drop_last=True, sampler=sampler)
     step_per_epoch = train_data.__len__()
     
     dataset_val = VimeoDataset('test', data_path)
-    val_data = DataLoader(dataset_val, batch_size=batch_size, pin_memory=True, num_workers=4)
+    val_data = DataLoader(dataset_val, batch_size=batch_size, pin_memory=True, num_workers=num_workers)
     
-    if local_rank == 0: print(f'Training with {MODEL_CONFIG["LOGNAME"]}...')
+    if local_rank == 0:
+        print(f'Training with {MODEL_CONFIG["LOGNAME"]}...')
+        if grad_accum > 1:
+            print(f'Gradient accumulation: {grad_accum} steps, effective batch = {batch_size * grad_accum}')
     time_stamp = time.time()
     for epoch in range(total_epochs):
         # Unfreeze backbone after freeze_epochs
@@ -98,13 +101,21 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
         
         # Use tqdm for progress bar
         pbar = tqdm(train_data, desc=f"Epoch {epoch}", disable=(local_rank != 0))
+        if grad_accum > 1:
+            model.optimG.zero_grad()
         for i, imgs in enumerate(pbar):
             data_time_interval = time.time() - time_stamp
             time_stamp = time.time()
             imgs = imgs.to(device, non_blocking=True) / 255.
             imgs, gt = imgs[:, 0:6], imgs[:, 6:]
             learning_rate = get_learning_rate(step, step_per_epoch, total_epochs, base_lr=lr)
-            _, loss_dict = model.update(imgs, gt, learning_rate, training=True)
+            if grad_accum > 1:
+                _, loss_dict = model.update(imgs, gt, learning_rate, training=True, accumulate=True)
+                if (i + 1) % grad_accum == 0 or (i + 1) == len(train_data):
+                    model.accum_step()
+                    model.optimG.zero_grad()
+            else:
+                _, loss_dict = model.update(imgs, gt, learning_rate, training=True)
             train_time_interval = time.time() - time_stamp
             time_stamp = time.time()
             
@@ -119,7 +130,7 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
                 
             step += 1
         nr_eval += 1
-        if nr_eval % 3 == 0:
+        if nr_eval % eval_interval == 0:
             evaluate(model, val_data, nr_eval, local_rank, writer_val=writer_val, best_psnr_holder=best_psnr_holder)
         model.save_model(local_rank)    
         dist.barrier()
@@ -163,6 +174,9 @@ if __name__ == "__main__":
     parser.add_argument('--mixed_ratio', type=str, default="2:1", help='Mixed ratio Vimeo:X4K (e.g. 2:1)')
     parser.add_argument('--crop_size', type=int, default=256, help='Training crop size (default: 256)')
     parser.add_argument('--lr', type=float, default=2e-4, help='Learning rate')
+    parser.add_argument('--num_workers', type=int, default=8, help='DataLoader num_workers')
+    parser.add_argument('--grad_accum', type=int, default=1, help='Gradient accumulation steps (effective batch = batch_size * grad_accum)')
+    parser.add_argument('--eval_interval', type=int, default=10, help='Evaluate every N epochs (default: 10)')
     # Phase control
     parser.add_argument('--phase', type=int, default=1, choices=[1, 2, 3], help='Training phase (1/2/3)')
     # Ablation experiment control
@@ -263,4 +277,5 @@ if __name__ == "__main__":
     train(model, local_rank, args.batch_size, args.data_path, args.x4k_path, 
           mixed_ratio=(v_w, x_w), freeze_epochs=freeze_epochs, total_epochs=epochs,
           curriculum=args.curriculum, curriculum_T=args.curriculum_T,
-          crop_size=args.crop_size, lr=args.lr)
+          crop_size=args.crop_size, lr=args.lr, num_workers=args.num_workers,
+          grad_accum=args.grad_accum, eval_interval=args.eval_interval)
