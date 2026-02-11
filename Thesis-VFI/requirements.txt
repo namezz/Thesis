@@ -1,0 +1,36 @@
+# Thesis-VFI: Hybrid Mamba2-Transformer for Video Frame Interpolation
+#
+# Install with: pip install -r requirements.txt
+#
+# NOTE: The following packages must be source-compiled for RTX 5090 (sm_120)
+# and are NOT included here:
+#   - mamba-ssm: git clone https://github.com/state-spaces/mamba && cd mamba && pip install .
+#   - causal-conv1d: git clone https://github.com/yacinemassena/causal-conv1d-sm120 && cd causal-conv1d-sm120 && pip install .
+#   - Build requires: pip install ninja && conda install -c nvidia cuda-toolkit=12.8
+#
+# PyTorch >= 2.8 is required for RTX 5090 (sm_120 Blackwell).
+# Install PyTorch separately: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#
+# NOTE: Use opencv-python-headless (not opencv-python) to avoid libtiff/libjpeg
+# conflicts with conda environments.
+
+# Core dependencies
+numpy>=2.0
+opencv-python-headless>=4.8
+Pillow>=10.0
+tqdm>=4.60
+einops>=0.7
+timm>=1.0
+
+# Training & logging
+tensorboard>=2.14
+tensorboardX>=2.6
+
+# Optional: demo video output
+imageio>=2.30
+
+# Optional: YUV benchmark utils (skimage.color)
+scikit-image>=0.21
+
+# setuptools pinned below 81 for tensorboard pkg_resources compatibility
+setuptools<81

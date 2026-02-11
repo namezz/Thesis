@@ -256,7 +256,14 @@ simply re-run the same training command -- it loads the latest checkpoint automa
 - mamba-ssm >= 2.0 (source-compiled from `state-spaces/mamba` for sm_120)
 - causal-conv1d >= 1.6.0 (source-compiled from `yacinemassena/causal-conv1d-sm120`)
 - Build tools: `ninja`, `conda install -c nvidia cuda-toolkit=12.8`
-- einops, timm, opencv-python
+
+Other dependencies (see `requirements.txt` for full list with version pins):
+
+```bash
+pip install -r requirements.txt
+```
+
+NOTE: mamba-ssm 和 causal-conv1d 不在 requirements.txt 中，需自行從原始碼編譯安裝（詳見 RTX 5090 Build Instructions 章節）。
 
 ## Changelog
 
