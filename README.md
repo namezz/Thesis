@@ -125,11 +125,11 @@ Each component is logged individually to TensorBoard (`loss/loss_lap`, `loss/los
 
 ### Target Scores (vs SOTA)
 
-| Benchmark | Phase 1 | Phase 2 | Phase 3 | VFIMamba | EMA-VFI |
+| Benchmark | Phase 1 (1.26M) | Phase 2 (9.0M) | Phase 3 | VFIMamba | MA-GCSPA |
 |-----------|---------|---------|---------|---------|---------|
-| Vimeo90K PSNR | >= 35.0 | >= 36.0 | >= 36.0 | 36.64 | 36.64 |
-| Vimeo90K SSIM | >= 0.975 | >= 0.978 | >= 0.978 | 0.9805 | -- |
-| UCF101 PSNR | >= 34.5 | >= 35.0 | >= 35.0 | 35.23 | -- |
+| Vimeo90K PSNR | >= 34.5 | >= 35.5 | >= 35.5 | 36.64 | 36.85 |
+| Vimeo90K SSIM | >= 0.970 | >= 0.978 | >= 0.978 | 0.9805 | -- |
+| UCF101 PSNR | >= 34.5 | >= 35.0 | >= 35.0 | 35.47 | -- |
 | SNU-FILM Hard | -- | >= 30.0 | >= 30.0 | 30.53 | -- |
 | SNU-FILM Extreme | -- | >= 26.0 | >= 26.0 | 26.46 | -- |
 | X-TEST 4K | -- | -- | >= 30.0 | 30.82 | -- |

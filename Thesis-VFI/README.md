@@ -199,28 +199,54 @@ simply re-run the same training command -- it loads the latest checkpoint automa
 
 ## Benchmark Targets
 
-| Dataset | Phase 1 | Phase 2 | Phase 3 | RIFE | VFIMamba |
+### SOTA Reference (Vimeo90K Triplet PSNR, 2-frame)
+
+| Model | Venue | Vimeo90K PSNR | UCF101 PSNR |
+| :--- | :--- | :--- | :--- |
+| MA-GCSPA | CVPR 2023 | 36.85 | -- |
+| EMA-VFI | CVPR 2023 | 36.64 | 35.29 |
+| VFIMamba | arXiv 2024 | 36.64 | 35.47 |
+| IQ-VFI | CVPR 2024 | 36.60 | -- |
+| AMT-G | CVPR 2023 | 36.53 | 35.20 |
+| RIFE-Large | ECCV 2022 | 36.19 | 35.28 |
+
+### Per-Phase Targets
+
+| Dataset | Phase 1 (1.26M) | Phase 2 (9.0M) | Phase 3 | RIFE | VFIMamba |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| Vimeo90K (PSNR) | >= 35.0 | >= 36.0 | >= 36.5 | 35.62 | 36.64 |
-| UCF101 (PSNR) | >= 34.5 | >= 35.0 | >= 35.4 | 35.28 | 35.47 |
+| Vimeo90K (PSNR) | >= 34.5 | >= 35.5 | >= 35.5 | 35.62 | 36.64 |
+| UCF101 (PSNR) | >= 34.5 | >= 35.0 | >= 35.0 | 35.28 | 35.47 |
 | SNU-FILM Hard | -- | >= 30.0 | >= 30.0 | -- | 30.53 |
 | SNU-FILM Extreme | -- | >= 26.0 | >= 26.0 | -- | 26.46 |
 | X-TEST 4K | -- | -- | >= 30.0 | -- | 30.82 |
+
+### Current Training Progress (Phase 1)
+
+| Epoch | PSNR | SSIM | Status |
+| :--- | :--- | :--- | :--- |
+| 3 | 32.58 | 0.9562 | done |
+| 6 | 33.10 | 0.9605 | done |
+| 9 | 33.32 | 0.9625 | done |
+| 12 | 33.50 | 0.9640 | done |
+| 15 | 33.64 | 0.9652 | running |
+| 300 (est.) | 34.5~35.0 | ~0.975 | target |
 
 ## Key References
 
 - **Mamba2 / SSD** (Dao & Gu, ICML 2024) -- State Space Duality, 2-8x faster SSM
 - **Gated Attention** (Qiu et al., NeurIPS 2025 Best Paper) -- SDPA output gating
-- **VFIMamba** (NeurIPS 2024) -- SSM for VFI, curriculum learning
+- **VFIMamba** (arXiv 2024) -- SSM for VFI, Interleaved SS2D cross-frame scanning
 - **MambaVision** (CVPR 2025) -- Hybrid Mamba-Transformer vision backbone
-- **MaTVLM** (ICCV 2025) -- Mamba2-Transformer hybrid VLM
+- **MaTVLM** (ICCV 2025) -- Mamba2-Transformer hybrid VLM, SSD-Attention duality init
 - **AMT** (CVPR 2023) -- All-pairs correlation, multi-field refinement
 - **SGM-VFI** (CVPR 2024) -- Sparse Global Matching for large motion
-- **EMA-VFI** (CVPR 2023) -- Hybrid CNN+Transformer VFI
+- **EMA-VFI** (CVPR 2023) -- Hybrid CNN+Transformer VFI, 36.64 dB
+- **MA-GCSPA** (CVPR 2023) -- Current Vimeo90K PSNR SOTA: 36.85 dB
 - **RIFE** (ECCV 2022) -- IFNet lightweight flow estimation
+- **BiM-VFI** (CVPR 2025) -- Bidirectional motion field for non-uniform motions
+- **GIMM-VFI** (NeurIPS 2024) -- Generative VFI, best LPIPS
 - **MaIR** (CVPR 2025) -- Nested S-shaped Scan for image restoration
 - **MambaIRv2** (CVPR 2025) -- Attentive State-Space Equation
-- **BiM-VFI** (CVPR 2025) -- Bidirectional motion field
 - **AceVFI Survey** (2025) -- Comprehensive VFI survey (250+ papers)
 
 ## Requirements
