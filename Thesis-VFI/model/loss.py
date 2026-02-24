@@ -51,16 +51,21 @@ def laplacian_pyramid(img, kernel, max_levels=3):
     return pyr
 
 class LapLoss(torch.nn.Module):
-    def __init__(self, max_levels=5, channels=3):
+    def __init__(self, max_levels=5, channels=3, eps=1e-6):
         super(LapLoss, self).__init__()
         self.max_levels = max_levels
         self.channels = channels
+        self.eps = eps
+        
+    def _charbonnier(self, a, b):
+        diff = a - b
+        return torch.mean(torch.sqrt(diff * diff + self.eps))
         
     def forward(self, input, target):
         kernel = gauss_kernel(channels=self.channels, device=input.device)
         pyr_input  = laplacian_pyramid(img=input, kernel=kernel, max_levels=self.max_levels)
         pyr_target = laplacian_pyramid(img=target, kernel=kernel, max_levels=self.max_levels)
-        return sum(torch.nn.functional.l1_loss(a, b) for a, b in zip(pyr_input, pyr_target))
+        return sum(self._charbonnier(a, b) for a, b in zip(pyr_input, pyr_target))
 
 # ============================================================
 # VGG Perceptual Loss (multi-layer feature matching)
@@ -79,8 +84,20 @@ class VGGPerceptualLoss(nn.Module):
         self.slice3 = nn.Sequential(*[vgg[x] for x in range(18, 27)]) # relu4_3
         for param in self.parameters():
             param.requires_grad = False
+        # Force eval mode (disable BN tracking & dropout)
+        self.slice1.eval()
+        self.slice2.eval()
+        self.slice3.eval()
         self.register_buffer('mean', torch.Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer('std', torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def train(self, mode=True):
+        """Override: keep VGG slices always in eval mode."""
+        super().train(mode)
+        self.slice1.eval()
+        self.slice2.eval()
+        self.slice3.eval()
+        return self
 
     def forward(self, input, target):
         input = (input - self.mean) / self.std
@@ -94,8 +111,11 @@ class VGGPerceptualLoss(nn.Module):
             h1_target = self.slice1(target)
             h2_target = self.slice2(h1_target)
             h3_target = self.slice3(h2_target)
-            
-        loss = F.l1_loss(h1, h1_target) + F.l1_loss(h2, h2_target) + F.l1_loss(h3, h3_target)
+        
+        # L2 normalize features to stabilize magnitude across batches
+        loss = (F.l1_loss(F.normalize(h1, dim=1), F.normalize(h1_target, dim=1)) +
+                F.l1_loss(F.normalize(h2, dim=1), F.normalize(h2_target, dim=1)) +
+                F.l1_loss(F.normalize(h3, dim=1), F.normalize(h3_target, dim=1)))
         return loss
 
 # ============================================================
@@ -179,29 +199,39 @@ class CompositeLoss(nn.Module):
     """
     Phase-aware composite loss for VFI training.
     
-    Phase 1: LapLoss + Ternary + VGG (backbone-only, no flow)
-    Phase 2: LapLoss + Ternary + VGG + FlowSmoothness (flow guidance)
+    Phase 1: LapLoss(Charb) + Ternary + VGG (backbone-only, no flow)
+    Phase 2: LapLoss(Charb) + Ternary(scheduled) + VGG(L2norm) + FlowSmoothness
     Phase 3: Same as Phase 2 (4K fine-tune)
     
-    Loss weights from reference implementations:
-    - LapLoss: 1.0 (primary, RIFE/VFIMamba/EMA-VFI standard)
-    - Ternary: 1.0 (proven in RIFE/IFRNet, captures structural similarity)
-    - VGG:    0.005 (perceptual quality, conservative weight to avoid hallucination)
-    - FlowSmooth: 0.1 (Phase 2+, edge-aware regularization)
+    Loss weights (SOTA-aligned):
+    - LapLoss(Charb): 1.0 (primary, smooth gradient near optimum)
+    - Ternary: 0→0.5 warmup over epochs 10~30 (Phase 2), 1.0 (Phase 1)
+    - VGG:    0.005 (perceptual, L2-normalized features)
+    - FlowSmooth: 20.0 (Phase 2+, target ~1-5% contribution)
     """
-    def __init__(self, phase=1, w_lap=1.0, w_ter=1.0, w_vgg=0.005, w_flow_smooth=0.1):
+    def __init__(self, phase=1, w_lap=1.0, w_ter=1.0, w_vgg=0.005, w_flow_smooth=20.0):
         super(CompositeLoss, self).__init__()
         self.phase = phase
         self.w_lap = w_lap
-        self.w_ter = w_ter
+        self.w_ter_max = w_ter if phase == 1 else 0.5
         self.w_vgg = w_vgg
         self.w_flow_smooth = w_flow_smooth
+        self.current_epoch = 0
         
         self.lap_loss = LapLoss()
         self.ternary_loss = Ternary()
         self.vgg_loss = VGGPerceptualLoss()
         if phase >= 2:
             self.flow_smooth_loss = FlowSmoothnessLoss()
+    
+    def _get_ternary_weight(self):
+        """Dynamic Ternary weight: Phase 1 = fixed, Phase 2 = warmup schedule."""
+        if self.phase == 1:
+            return self.w_ter_max
+        # Phase 2+: 0 for epoch<10, linear ramp to w_ter_max by epoch 30
+        if self.current_epoch < 10:
+            return 0.0
+        return self.w_ter_max * min(1.0, (self.current_epoch - 10) / 20.0)
     
     def forward(self, pred, gt, flow=None, img0=None):
         """
@@ -217,12 +247,14 @@ class CompositeLoss(nn.Module):
         loss_ter = self.ternary_loss(pred, gt)
         loss_vgg = self.vgg_loss(pred, gt)
         
-        total = self.w_lap * loss_lap + self.w_ter * loss_ter + self.w_vgg * loss_vgg
+        w_ter = self._get_ternary_weight()
+        total = self.w_lap * loss_lap + w_ter * loss_ter + self.w_vgg * loss_vgg
         
         loss_dict = {
             'loss_lap': loss_lap.item(),
             'loss_ter': loss_ter.item(),
             'loss_vgg': loss_vgg.item(),
+            'w_ter': w_ter,
         }
         
         if self.phase >= 2 and flow is not None and img0 is not None:

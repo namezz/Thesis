@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 try:
     from mamba_ssm import Mamba2
 except ImportError:
@@ -11,7 +12,7 @@ except ImportError:
                   "Install with: pip install mamba-ssm>=2.0")
     Mamba2 = None
 
-from .utils import window_partition, window_reverse, Mlp, ECAB, scan_images, merge_images, interleaved_scan, interleaved_merge, ManifoldResConnection, matvlm_init_mamba2
+from .utils import window_partition, window_reverse, Mlp, ECAB, scan_images, merge_images, interleaved_scan, interleaved_merge, ManifoldResConnection, matvlm_init_mamba2, CrossGatingFusion
 
 class GatedWindowAttention(nn.Module):
     """
@@ -104,10 +105,13 @@ class LGSBlock(nn.Module):
     def __init__(self, dim, num_heads, window_size=7, shift_size=0, mlp_ratio=4., 
                  drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
                  mamba_d_state=64, mamba_d_conv=4, mamba_expand=2, use_mhc=False,
-                 backbone_mode='hybrid', use_ecab=True):
+                 backbone_mode='hybrid', use_ecab=True, use_cross_gating=False,
+                 use_checkpointing=True):
         super().__init__()
         self.dim = dim
         self.backbone_mode = backbone_mode
+        self.use_cross_gating = use_cross_gating
+        self.use_checkpointing = use_checkpointing
         self.norm1 = norm_layer(dim)
         
         # Branch A: Mamba2 (only if hybrid or mamba2_only)
@@ -143,6 +147,8 @@ class LGSBlock(nn.Module):
         if backbone_mode == 'hybrid':
             if use_mhc:
                 self.mhc = ManifoldResConnection(dim, num_streams=3, layer_index=0)
+            elif use_cross_gating:
+                self.cross_gate = CrossGatingFusion(dim)
             else:
                 self.fusion_conv = nn.Conv2d(dim * 2, dim, 1)  # 1x1 conv to merge branches
         else:
@@ -191,7 +197,12 @@ class LGSBlock(nn.Module):
             with torch.amp.autocast('cuda', enabled=False):
                 x_view = x_norm.float().view(twoB, H, W, C)  # (2B, H, W, C)
                 x_scan = interleaved_scan(x_view)      # (4B, 2*H*W, C)
-                x_mamba_out = self.mamba(x_scan)        # (4B, 2*H*W, C)
+                # Gradient checkpointing: recompute Mamba forward during backward
+                # to save ~20% VRAM from SSD intermediate tensors
+                if self.training and self.use_checkpointing:
+                    x_mamba_out = grad_checkpoint(self.mamba, x_scan, use_reentrant=False)
+                else:
+                    x_mamba_out = self.mamba(x_scan)        # (4B, 2*H*W, C)
                 x_mamba_img = interleaved_merge(x_mamba_out, B, H, W)  # (2B, H, W, C)
                 x_mamba = x_mamba_img.flatten(1, 2).to(x_norm.dtype)   # (2B, L, C)
         
@@ -261,17 +272,25 @@ class LGSBlock(nn.Module):
                 # mHC depth connection: route branch output back and add to residuals
                 x = self.drop_path(add_residual(branch_out))
             else:
-                x_cat = torch.cat([x_mamba, x_attn], dim=-1)
-                x_cat = x_cat.transpose(1, 2).view(twoB, 2*C, H, W)
-                x_fused = self.fusion_conv(x_cat)
-                # Apply channel attention
-                if self.use_ecab:
-                    x_fused = self.cab(x_fused)
+                if self.use_cross_gating:
+                    # CrossGating Fusion: spatial-aware bi-directional gating
+                    fm_2d = x_mamba.transpose(1, 2).view(twoB, C, H, W)
+                    fa_2d = x_attn.transpose(1, 2).view(twoB, C, H, W)
+                    x_fused = self.cross_gate(fm_2d, fa_2d)  # (2B, C, H, W)
+                    x_fused = x_fused.flatten(2).transpose(1, 2)  # (2B, L, C)
+                    x = shortcut + self.drop_path(x_fused)
                 else:
-                    se_weight = self.cab(x_fused)
-                    x_fused = x_fused * se_weight
-                x_fused = x_fused.flatten(2).transpose(1, 2)  # (B, L, C)
-                x = shortcut + self.drop_path(x_fused)
+                    x_cat = torch.cat([x_mamba, x_attn], dim=-1)
+                    x_cat = x_cat.transpose(1, 2).view(twoB, 2*C, H, W)
+                    x_fused = self.fusion_conv(x_cat)
+                    # Apply channel attention
+                    if self.use_ecab:
+                        x_fused = self.cab(x_fused)
+                    else:
+                        se_weight = self.cab(x_fused)
+                        x_fused = x_fused * se_weight
+                    x_fused = x_fused.flatten(2).transpose(1, 2)  # (B, L, C)
+                    x = shortcut + self.drop_path(x_fused)
         elif self.backbone_mode == 'mamba2_only':
             x_fused = x_mamba.transpose(1, 2).view(twoB, C, H, W)
             if self.use_ecab:
@@ -300,7 +319,8 @@ class BasicLayer(nn.Module):
     """ A basic Swin/Mamba layer for one stage """
     def __init__(self, dim, output_dim, depth, num_heads, window_size, mlp_ratio=4., drop=0., 
                  drop_path=0., norm_layer=nn.LayerNorm, downsample=None,
-                 backbone_mode='hybrid', use_mhc=False, use_ecab=True):
+                 backbone_mode='hybrid', use_mhc=False, use_ecab=True,
+                 use_cross_gating=False, use_checkpointing=True):
         super().__init__()
         self.dim = dim
         self.blocks = nn.ModuleList([
@@ -312,7 +332,9 @@ class BasicLayer(nn.Module):
                 norm_layer=norm_layer,
                 backbone_mode=backbone_mode,
                 use_mhc=use_mhc,
-                use_ecab=use_ecab
+                use_ecab=use_ecab,
+                use_cross_gating=use_cross_gating,
+                use_checkpointing=use_checkpointing
             )
             for i in range(depth)
         ])
@@ -337,7 +359,8 @@ class HybridBackbone(nn.Module):
     """
     def __init__(self, embed_dims=[32, 64, 128], depths=[2, 2, 2], num_heads=[2, 4, 8], 
                  window_sizes=[7, 7, 7], mlp_ratios=[4, 4, 4], drop_rate=0., drop_path_rate=0.1,
-                 backbone_mode='hybrid', use_mhc=False, use_ecab=True):
+                 backbone_mode='hybrid', use_mhc=False, use_ecab=True,
+                 use_cross_gating=False, use_checkpointing=True):
         super().__init__()
         
         self.num_layers = len(depths)
@@ -368,7 +391,9 @@ class HybridBackbone(nn.Module):
                 downsample=None,
                 backbone_mode=backbone_mode,
                 use_mhc=use_mhc,
-                use_ecab=use_ecab
+                use_ecab=use_ecab,
+                use_cross_gating=use_cross_gating,
+                use_checkpointing=use_checkpointing
             )
             self.layers.append(layer)
             
@@ -379,6 +404,12 @@ class HybridBackbone(nn.Module):
                  nn.Conv2d(embed_dims[i], embed_dims[i+1], 3, 2, 1),
                  nn.LeakyReLU(0.1)
              ))
+        
+        # Learnable frame merge: concat + 1x1 conv (avoids ghosting from naive sum)
+        self.merge_convs = nn.ModuleList([
+            nn.Conv2d(embed_dims[i] * 2, embed_dims[i], kernel_size=1)
+            for i in range(self.num_layers)
+        ])
 
     def forward(self, img0, img1):
         """
@@ -399,10 +430,10 @@ class HybridBackbone(nn.Module):
         
         for i, layer in enumerate(self.layers):
             x, H, W = layer(x, H, W)
-            # Output features: (2B, C, H, W) -> sum frame0 and frame1 features -> (B, C, H, W)
+            # Output features: concat frame0 and frame1 then learn to merge
             x_out = x.transpose(1, 2).view(twoB, -1, H, W)
-            # Merge the two frames' features by summation (cross-frame info already mixed by Mamba)
-            x_out_merged = x_out[:B_orig] + x_out[B_orig:]  # (B, C, H, W)
+            x_out_concat = torch.cat([x_out[:B_orig], x_out[B_orig:]], dim=1)  # (B, 2C, H, W)
+            x_out_merged = self.merge_convs[i](x_out_concat)  # (B, C, H, W)
             outs.append(x_out_merged)
             
             if i < self.num_layers - 1:
@@ -441,5 +472,7 @@ def build_backbone(cfg):
         mlp_ratios=cfg['mlp_ratios'],
         backbone_mode=cfg.get('backbone_mode', 'hybrid'),
         use_mhc=cfg.get('use_mhc', False),
-        use_ecab=cfg.get('use_ecab', True)
+        use_ecab=cfg.get('use_ecab', True),
+        use_cross_gating=cfg.get('use_cross_gating', False),
+        use_checkpointing=cfg.get('use_checkpointing', True)
     )

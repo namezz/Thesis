@@ -8,10 +8,11 @@ from model.loss import CompositeLoss
 from config import MODEL_CONFIG
 
 class Model:
-    def __init__(self, local_rank):
+    def __init__(self, local_rank, backbone_lr_scale=1.0):
         self.net = ThesisModel(MODEL_CONFIG['MODEL_ARCH'])
         self.name = MODEL_CONFIG['LOGNAME']
         self.device_id = local_rank
+        self.backbone_lr_scale = backbone_lr_scale
 
         # Phase-aware composite loss
         phase = MODEL_CONFIG.get('PHASE', 1)
@@ -20,11 +21,22 @@ class Model:
         # Move everything to GPU
         self.device()
 
-        # train
-        self.optimG = AdamW(self.net.parameters(), lr=2e-4, weight_decay=1e-4)
+        # Discriminative LR: backbone gets scaled-down LR to protect pre-trained weights
+        backbone_params = list(self.net.backbone.parameters())
+        backbone_ids = set(id(p) for p in backbone_params)
+        other_params = [p for p in self.net.parameters() if id(p) not in backbone_ids]
         
-        # AMP
-        self.scaler = torch.amp.GradScaler('cuda')
+        self.optimG = AdamW([
+            {'params': backbone_params, 'lr': 2e-4 * backbone_lr_scale, 'name': 'backbone'},
+            {'params': other_params, 'lr': 2e-4, 'name': 'other'},
+        ], weight_decay=1e-4)
+        
+        # AMP: BF16 has same exponent range as FP32, no overflow risk
+        self.use_bf16 = torch.cuda.is_bf16_supported()
+        if self.use_bf16:
+            self.scaler = None
+        else:
+            self.scaler = torch.amp.GradScaler('cuda', init_scale=1024)
         
         if local_rank != -1:
             self.net = DDP(self.net, device_ids=[local_rank], output_device=local_rank, 
@@ -57,16 +69,36 @@ class Model:
                     state_dict = {f'module.{k}': v for k, v in state_dict.items()}
                 elif not has_module and ckpt_has_module:
                     state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
-                self.net.load_state_dict(state_dict, strict=False)
-                # Load optimizer state if available
+                # Shape-safe loading: skip keys with mismatched shapes
+                # (handles Phase 1→2 transition where RefineNet channels change)
+                compatible = {}
+                skipped = []
+                for k, v in state_dict.items():
+                    if k in model_dict and model_dict[k].shape == v.shape:
+                        compatible[k] = v
+                    else:
+                        skipped.append(k)
+                missing = set(model_dict.keys()) - set(compatible.keys())
+                self.net.load_state_dict(compatible, strict=False)
+                if skipped:
+                    print(f"  Skipped {len(skipped)} keys (shape mismatch): {skipped[:5]}{'...' if len(skipped)>5 else ''}")
+                if missing:
+                    new_modules = set(k.split('.')[0] if not k.startswith('module.') else k.split('.')[1] for k in missing)
+                    print(f"  New modules (random init): {new_modules}")
+                # Load optimizer state if available (skip if param groups changed)
                 optim_path = f'ckpt/{name}_optim.pkl'
                 if os.path.exists(optim_path):
                     optim_state = torch.load(optim_path, map_location='cpu', weights_only=False)
-                    if 'optimizer' in optim_state:
-                        self.optimG.load_state_dict(optim_state['optimizer'])
-                    if 'scaler' in optim_state:
-                        self.scaler.load_state_dict(optim_state['scaler'])
-                    print(f"  Loaded optimizer state from {optim_path}")
+                    try:
+                        if 'optimizer' in optim_state:
+                            self.optimG.load_state_dict(optim_state['optimizer'])
+                        if 'scaler' in optim_state and self.scaler is not None:
+                            self.scaler.load_state_dict(optim_state['scaler'])
+                        print(f"  Loaded optimizer state from {optim_path}")
+                    except (ValueError, RuntimeError) as e:
+                        print(f"  Skipped optimizer state (param groups changed): {e}")
+                        optim_state.pop('optimizer', None)
+                        optim_state.pop('scaler', None)
                     return optim_state.get('train_state', None)
             else:
                 print(f"No checkpoint found at {path}, starting from scratch.")
@@ -77,11 +109,12 @@ class Model:
             # Save without 'module.' prefix for portability
             state_dict = self.net.module.state_dict() if hasattr(self.net, 'module') else self.net.state_dict()
             torch.save(state_dict, f'ckpt/{self.name}{suffix}.pkl')
-            # Save optimizer + scaler + training state for proper resume
+            # Save optimizer + training state for proper resume
             optim_dict = {
                 'optimizer': self.optimG.state_dict(),
-                'scaler': self.scaler.state_dict(),
             }
+            if self.scaler is not None:
+                optim_dict['scaler'] = self.scaler.state_dict()
             if train_state is not None:
                 optim_dict['train_state'] = train_state
             torch.save(optim_dict, f'ckpt/{self.name}{suffix}_optim.pkl')
@@ -119,25 +152,37 @@ class Model:
         print("Backbone parameters unfrozen.")
     
     def update(self, imgs, gt, learning_rate=0, training=True, accumulate=False):
+        # Discriminative LR: backbone gets scaled LR
         for param_group in self.optimG.param_groups:
-            param_group['lr'] = learning_rate
+            if param_group.get('name') == 'backbone':
+                param_group['lr'] = learning_rate * self.backbone_lr_scale
+            else:
+                param_group['lr'] = learning_rate
         if training:
             self.train()
             x = torch.cat(imgs, dim=1) if isinstance(imgs, list) else imgs
             img0 = x[:, :3]
             
-            with torch.amp.autocast('cuda'):
+            amp_dtype = torch.bfloat16 if self.use_bf16 else torch.float16
+            with torch.amp.autocast('cuda', dtype=amp_dtype):
                 pred, flow = self.net(x)
                 loss_total, loss_dict = self.loss_fn(pred, gt, flow=flow, img0=img0)
             
             if not accumulate:
                 self.optimG.zero_grad()
-            self.scaler.scale(loss_total).backward()
+            if self.scaler is not None:
+                self.scaler.scale(loss_total).backward()
+            else:
+                loss_total.backward()
             if not accumulate:
-                self.scaler.unscale_(self.optimG)
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimG)
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
-                self.scaler.step(self.optimG)
-                self.scaler.update()
+                if self.scaler is not None:
+                    self.scaler.step(self.optimG)
+                    self.scaler.update()
+                else:
+                    self.optimG.step()
             return pred, loss_dict
         else: 
             self.eval()
@@ -148,8 +193,12 @@ class Model:
 
     def accum_step(self):
         """Perform optimizer step after gradient accumulation."""
-        self.scaler.unscale_(self.optimG)
+        if self.scaler is not None:
+            self.scaler.unscale_(self.optimG)
         torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
-        self.scaler.step(self.optimG)
-        self.scaler.update()
+        if self.scaler is not None:
+            self.scaler.step(self.optimG)
+            self.scaler.update()
+        else:
+            self.optimG.step()
         self.optimG.zero_grad()

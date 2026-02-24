@@ -13,7 +13,7 @@ from dataset import VimeoDataset, X4KDataset, MixedDataset
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data.distributed import DistributedSampler
-from config import MODEL_CONFIG, PHASE1_CONFIG, PHASE2_CONFIG, PHASE3_CONFIG, ABLATION_CONFIGS, init_model_config
+from config import MODEL_CONFIG, PHASE1_CONFIG, PHASE2_CONFIG, PHASE2_CG_CONFIG, PHASE3_CONFIG, ABLATION_CONFIGS, init_model_config, PHASE1_V2_CONFIG, PHASE2_V2_CONFIG
 from benchmark.utils.pytorch_msssim import ssim_matlab
 
 device = torch.device("cuda")
@@ -93,7 +93,10 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
         
         sampler.set_epoch(epoch)
         
-        # Curriculum learning: update crop size
+        # Update loss function with current epoch for dynamic scheduling
+        model.loss_fn.current_epoch = epoch
+        
+        # Curriculum learning: update crop size and X4K mixing ratio
         if curriculum:
             if epoch < curriculum_T:
                 crop_idx = 0  # 256
@@ -112,6 +115,15 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
                     dataset.x4k.h = dataset.x4k.w = new_crop
             if local_rank == 0 and (epoch == 0 or epoch == curriculum_T or epoch == curriculum_T * 2):
                 print(f"Curriculum: epoch {epoch}, crop_size={new_crop}")
+            
+            # Sigmoid X4K mixing schedule: P(e) = P_max / (1 + exp(-γ(e - T_mid)))
+            if hasattr(dataset, 'set_x4k_prob'):
+                p_max = 0.5  # max 50% X4K (1:1 ratio)
+                gamma = 0.2
+                x4k_prob = p_max / (1.0 + math.exp(-gamma * (epoch - curriculum_T)))
+                dataset.set_x4k_prob(x4k_prob)
+                if local_rank == 0 and epoch % 10 == 0:
+                    print(f"Curriculum: epoch {epoch}, X4K prob={x4k_prob:.3f}")
         
         # Use tqdm for progress bar
         pbar = tqdm(train_data, desc=f"Epoch {epoch}", disable=(local_rank != 0))
@@ -201,10 +213,13 @@ if __name__ == "__main__":
                         help='Backbone mode for ablation')
     parser.add_argument('--use_mhc', action='store_true', help='Use Manifold Hyper-Connections')
     parser.add_argument('--use_ecab', action=argparse.BooleanOptionalAction, default=True, help='Use ECAB (default: True, --no-use_ecab to disable)')
+    parser.add_argument('--backbone_v2', action='store_true', help='Use V2 backbone (Factorized SSM + CrossGating)')
+    parser.add_argument('--cross_gating', action='store_true', help='Use CrossGating fusion (V1 backbone upgrade)')
     # Training control
     parser.add_argument('--epochs', type=int, default=300, help='Number of epochs')
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
     parser.add_argument('--freeze_backbone', type=int, default=0, help='Freeze backbone for N epochs (Phase 2)')
+    parser.add_argument('--backbone_lr_scale', type=float, default=1.0, help='Backbone LR multiplier (e.g. 0.1 for discriminative LR)')
     parser.add_argument('--dry_run', action='store_true', help='Quick sanity check (1 epoch)')
     # Curriculum learning (Phase 3)
     parser.add_argument('--curriculum', action='store_true', help='Enable curriculum learning')
@@ -222,9 +237,14 @@ if __name__ == "__main__":
     # Configure MODEL_CONFIG based on phase and arguments
     # =============================================================================
     if args.phase == 1:
-        base_config = PHASE1_CONFIG.copy()
+        base_config = (PHASE1_V2_CONFIG if args.backbone_v2 else PHASE1_CONFIG).copy()
     elif args.phase == 2:
-        base_config = PHASE2_CONFIG.copy()
+        if args.backbone_v2:
+            base_config = PHASE2_V2_CONFIG.copy()
+        elif args.cross_gating:
+            base_config = PHASE2_CG_CONFIG.copy()
+        else:
+            base_config = PHASE2_CONFIG.copy()
     elif args.phase == 3:
         base_config = PHASE3_CONFIG.copy()
     else:
@@ -273,10 +293,16 @@ if __name__ == "__main__":
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = True
     
-    model = Model(local_rank)
+    model = Model(local_rank, backbone_lr_scale=args.backbone_lr_scale)
     
-    # Resume from checkpoint if specified
-    if args.resume:
+    # Resume from checkpoint: prefer current experiment's own checkpoint (crash recovery),
+    # fall back to --resume (initial Phase 1→2 transition)
+    own_ckpt = f'ckpt/{MODEL_CONFIG["LOGNAME"]}.pkl'
+    if os.path.exists(own_ckpt):
+        if local_rank == 0:
+            print(f"Found own checkpoint {own_ckpt}, resuming (crash recovery)")
+        model.load_model(name=MODEL_CONFIG["LOGNAME"])
+    elif args.resume:
         if local_rank == 0:
             print(f"Resuming from {args.resume}")
         model.load_model(name=args.resume.replace('.pkl', '').replace('ckpt/', ''))
