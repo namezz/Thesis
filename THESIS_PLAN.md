@@ -267,7 +267,7 @@ feats + ctx0 + ctx1 --> RefineNet (use_context=True) --> residual + refine_mask
 #### 4.2.3 訓練配置
 | 項目 | 設定 |
 | :--- | :--- |
-| 訓練資料 | Vimeo90K Triplet (同 Phase 1) |
+| 訓練資料 | Vimeo90K + X4K1000FPS 混合 (ratio 4:1)，提早讓 FlowEstimator 接觸大動作場景（參考 VFIMamba 在 global motion pretraining 階段即使用 X-TRAIN） |
 | Optimizer | AdamW, lr=1e-4 (降低 lr 避免破壞 backbone), weight_decay=1e-4 |
 | LR Schedule | Linear warmup 2000 steps → Cosine decay to 1e-5 |
 | Batch Size | **2~4 (RTX 5090 32GB)** / **8~16 (A100 80GB)** |
@@ -297,6 +297,8 @@ ls -la ckpt/phase1_hybrid_v2_best.pkl
 torchrun --nproc_per_node=1 train.py \
     --batch_size 4 \
     --data_path /josh/dataset/vimeo90k/vimeo_triplet \
+    --x4k_path /josh/dataset/X4K1000FPS \
+    --mixed_ratio 4:1 \
     --phase 2 --dry_run \
     --resume phase1_hybrid_v2_best \
     --freeze_backbone 1
@@ -304,10 +306,12 @@ torchrun --nproc_per_node=1 train.py \
 # ============================================================
 # Step 2: Phase 2 主實驗 (Exp-2c: Feature-level Warping)
 # ============================================================
-# RTX 5090 32GB
+# RTX 5090 32GB — 混入少量 X4K (4:1) 讓 FlowEstimator 提早接觸大動作
 nohup torchrun --nproc_per_node=1 train.py \
     --batch_size 4 --lr 1e-4 \
     --data_path /josh/dataset/vimeo90k/vimeo_triplet \
+    --x4k_path /josh/dataset/X4K1000FPS \
+    --mixed_ratio 4:1 \
     --phase 2 --epochs 200 \
     --resume phase1_hybrid_v2_best \
     --freeze_backbone 50 \

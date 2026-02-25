@@ -340,6 +340,54 @@ class ManifoldResConnection(nn.Module):
         return add_residual_fn(branch_out)
 
 
+class CrossGatingFusion(nn.Module):
+    """
+    Bi-directional Cross-Gating Fusion for Mamba2 + Attention branch outputs.
+    
+    Uses Conv2d bottleneck gates for spatial-aware cross-filtering:
+    - Attention's sharp edges filter Mamba's global features (suppress over-smoothing)
+    - Mamba's global context suppresses Attention's local noise
+    
+    Math:
+        F_out = W_proj[ (F_M ⊙ σ(H_attn(F_A))) ∥ (F_A ⊙ σ(H_mamba(F_M))) ]
+    
+    Gradient advantage: ∂L/∂F_M contains F_A-weighted dynamics, forcing Mamba
+    to learn complementary features to Attention (true synergy).
+    """
+    def __init__(self, d_model):
+        super().__init__()
+        self.d_model = d_model
+        # Gate: Mamba features → gate for Attention branch
+        self.gate_mamba_to_attn = nn.Sequential(
+            nn.Conv2d(d_model, d_model // 2, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(d_model // 2, d_model, kernel_size=1)
+        )
+        # Gate: Attention features → gate for Mamba branch
+        self.gate_attn_to_mamba = nn.Sequential(
+            nn.Conv2d(d_model, d_model // 2, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(d_model // 2, d_model, kernel_size=1)
+        )
+        # Concatenate gated features and project back
+        self.out_proj = nn.Conv2d(d_model * 2, d_model, kernel_size=1)
+
+    def forward(self, f_mamba, f_attn):
+        """
+        Args:
+            f_mamba: (B, C, H, W) Mamba2 branch output (global structure + temporal)
+            f_attn:  (B, C, H, W) Attention branch output (local texture + edges)
+        Returns:
+            (B, C, H, W) fused features
+        """
+        gate_from_mamba = torch.sigmoid(self.gate_mamba_to_attn(f_mamba))
+        gate_from_attn = torch.sigmoid(self.gate_attn_to_mamba(f_attn))
+        f_mamba_gated = f_mamba * gate_from_attn
+        f_attn_gated = f_attn * gate_from_mamba
+        f_fused = torch.cat([f_mamba_gated, f_attn_gated], dim=1)
+        return self.out_proj(f_fused)
+
+
 def matvlm_init_mamba2(mamba_layer, attn_layer):
     """
     MaTVLM-style initialization: transfer Attention Q/K/V weights to Mamba2 B/C/x.

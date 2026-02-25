@@ -12,7 +12,7 @@ except ImportError:
                   "Install with: pip install mamba-ssm>=2.0")
     Mamba2 = None
 
-from .utils import window_partition, window_reverse, Mlp, ECAB, scan_images, merge_images, interleaved_scan, interleaved_merge, ManifoldResConnection, matvlm_init_mamba2, CrossGatingFusion
+from .utils import window_partition, window_reverse, Mlp, ECAB, scan_images, merge_images, ManifoldResConnection, matvlm_init_mamba2, CrossGatingFusion
 
 class GatedWindowAttention(nn.Module):
     """
@@ -123,6 +123,13 @@ class LGSBlock(nn.Module):
                 d_conv=mamba_d_conv,
                 expand=mamba_expand
             )
+            # Temporal cross-fusion: lightweight MLP for cross-frame interaction
+            # Replaces interleaved_scan (2HW seq) with factorized approach (HW seq + temporal MLP)
+            self.time_mix_proj = nn.Sequential(
+                nn.Linear(dim * 2, dim),
+                nn.SiLU(),
+                nn.Linear(dim, dim)
+            )
         elif self.use_mamba and Mamba2 is None:
             raise ImportError(
                 "Mamba2 is required for backbone_mode='hybrid' or 'mamba2_only' "
@@ -190,21 +197,33 @@ class LGSBlock(nn.Module):
         x_mamba = None
         x_attn = None
         
-        # --- Branch A: Mamba2 (Global) with VFIMamba-style Interleaved SS2D ---
-        # Interleaves tokens from frame0 and frame1 into one sequence,
-        # enabling cross-frame temporal interaction within the SSM's recurrent state.
+        # --- Branch A: Factorized Spatio-Temporal SSM ---
+        # Spatial: per-frame SS2D scan (HW sequence, NOT 2HW interleaved)
+        # Temporal: lightweight MLP cross-fusion between frame features
+        # This halves Mamba sequence length vs interleaved_scan → ~50% VRAM savings
         if self.use_mamba:
             with torch.amp.autocast('cuda', enabled=False):
                 x_view = x_norm.float().view(twoB, H, W, C)  # (2B, H, W, C)
-                x_scan = interleaved_scan(x_view)      # (4B, 2*H*W, C)
-                # Gradient checkpointing: recompute Mamba forward during backward
-                # to save ~20% VRAM from SSD intermediate tensors
+                # Spatial scan: per-frame 4-direction SS2D (sequence length = H*W)
+                x_scan = scan_images(x_view)             # (4*2B, H*W, C) = (8B, L, C)
                 if self.training and self.use_checkpointing:
                     x_mamba_out = grad_checkpoint(self.mamba, x_scan, use_reentrant=False)
                 else:
-                    x_mamba_out = self.mamba(x_scan)        # (4B, 2*H*W, C)
-                x_mamba_img = interleaved_merge(x_mamba_out, B, H, W)  # (2B, H, W, C)
-                x_mamba = x_mamba_img.flatten(1, 2).to(x_norm.dtype)   # (2B, L, C)
+                    x_mamba_out = self.mamba(x_scan)      # (8B, L, C)
+                # Merge 4 scan directions back → (2B, H, W, C)
+                x_spatial = merge_images(x_mamba_out, twoB, H, W)  # (2B, H, W, C)
+                x_spatial = x_spatial.flatten(1, 2)       # (2B, L, C)
+                
+                # Temporal cross-fusion: exchange information between frame0 and frame1
+                f0 = x_spatial[:B]   # (B, L, C) — frame 0 spatial features
+                f1 = x_spatial[B:]   # (B, L, C) — frame 1 spatial features
+                # Cross-frame context: each frame sees the other via concat→MLP
+                ctx_0 = torch.cat([f0, f1], dim=-1)  # (B, L, 2C)
+                ctx_1 = torch.cat([f1, f0], dim=-1)  # (B, L, 2C)
+                f0_fused = f0 + self.time_mix_proj(ctx_0)  # residual temporal mixing
+                f1_fused = f1 + self.time_mix_proj(ctx_1)
+                
+                x_mamba = torch.cat([f0_fused, f1_fused], dim=0).to(x_norm.dtype)  # (2B, L, C)
         
         # --- Branch B: Window Attention (Local) ---
         # Operates per-frame independently (2B batch)

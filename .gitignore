@@ -5,3 +5,7 @@ Thesis-VFI/ckpt/
 Thesis-VFI/log/
 *.pkl
 .DS_Store
+.ipynb_checkpoints/
+Thesis-VFI/=*
+Thesis-VFI/*.log
+Thesis-VFI/logs_*.txt

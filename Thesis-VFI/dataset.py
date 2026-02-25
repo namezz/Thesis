@@ -27,37 +27,81 @@ class X4KDataset(Dataset):
         if not os.path.exists(path):
             raise FileNotFoundError(f"X4K dataset path not found: {path}")
         
-        # X4K Structure: path/train/SCENE/*.png
-        search_path = os.path.join(path, 'train', '*')
-        self.scenes = sorted(glob.glob(search_path))
+        # Try decoded PNG dirs first, fall back to encoded mp4s
+        png_dir = os.path.join(path, 'train')
+        mp4_dir = os.path.join(path, 'encoded_train')
+        self.use_mp4 = False
+        
+        if os.path.isdir(png_dir) and len(glob.glob(os.path.join(png_dir, '*'))) > 0:
+            self.scenes = sorted(glob.glob(os.path.join(png_dir, '*')))
+        elif os.path.isdir(mp4_dir):
+            # Read directly from mp4 files (no PNG decode needed)
+            self.scenes = sorted(glob.glob(os.path.join(mp4_dir, '*', '*.mp4')))
+            self.use_mp4 = True
+        else:
+            raise RuntimeError(f"X4KDataset: No train/ or encoded_train/ found in {path}")
+        
         if len(self.scenes) == 0:
-            raise RuntimeError(f"X4KDataset: No scenes found in {os.path.join(path, 'train')}. Check folder structure.")
-        print(f"X4KDataset: Found {len(self.scenes)} scenes in {path}")
+            raise RuntimeError(f"X4KDataset: No scenes found in {path}")
+        
+        # Cache frame counts for mp4 files to avoid repeated opens
+        if self.use_mp4:
+            self._frame_counts = {}
+        print(f"X4KDataset: Found {len(self.scenes)} {'mp4 sequences' if self.use_mp4 else 'scenes'} in {path}")
 
     def __len__(self):
         return len(self.scenes)
 
+    def _read_mp4_frames(self, mp4_path, indices):
+        """Read specific frames from mp4 using cv2.VideoCapture."""
+        cap = cv2.VideoCapture(mp4_path)
+        if not cap.isOpened():
+            return None
+        frames = {}
+        for idx in sorted(indices):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret:
+                frames[idx] = frame
+        cap.release()
+        return frames
+    
+    def _get_frame_count(self, mp4_path):
+        """Get frame count with caching."""
+        if mp4_path not in self._frame_counts:
+            cap = cv2.VideoCapture(mp4_path)
+            self._frame_counts[mp4_path] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+        return self._frame_counts[mp4_path]
+
     def getimg(self, index, _depth=0):
         if _depth > 10:
             raise RuntimeError("X4KDataset: Too many retries finding valid scene")
-        scene_path = self.scenes[index]
-        frames = sorted(glob.glob(os.path.join(scene_path, '*.png')))
         
-        if len(frames) < self.stride_range[0] + 1:
-            # Fallback if scene too short
-            return self.getimg(random.randint(0, len(self.scenes)-1), _depth + 1)
-            
-        # Temporal Subsampling (Phase 3 Requirement)
-        max_stride = min(self.stride_range[1], len(frames) - 1)
-        stride = random.randint(self.stride_range[0], max_stride)
-        # Sample t, t+stride/2, t+stride
-        t = random.randint(0, len(frames) - stride - 1)
-        
-        img0 = cv2.imread(frames[t])
-        gt = cv2.imread(frames[t + stride // 2])
-        img1 = cv2.imread(frames[t + stride])
-        
-        return img0, gt, img1
+        if self.use_mp4:
+            mp4_path = self.scenes[index]
+            n_frames = self._get_frame_count(mp4_path)
+            if n_frames < self.stride_range[0] + 1:
+                return self.getimg(random.randint(0, len(self.scenes)-1), _depth + 1)
+            max_stride = min(self.stride_range[1], n_frames - 1)
+            stride = random.randint(self.stride_range[0], max_stride)
+            t = random.randint(0, n_frames - stride - 1)
+            frames = self._read_mp4_frames(mp4_path, [t, t + stride // 2, t + stride])
+            if frames is None or len(frames) < 3:
+                return self.getimg(random.randint(0, len(self.scenes)-1), _depth + 1)
+            return frames[t], frames[t + stride // 2], frames[t + stride]
+        else:
+            scene_path = self.scenes[index]
+            frames = sorted(glob.glob(os.path.join(scene_path, '*.png')))
+            if len(frames) < self.stride_range[0] + 1:
+                return self.getimg(random.randint(0, len(self.scenes)-1), _depth + 1)
+            max_stride = min(self.stride_range[1], len(frames) - 1)
+            stride = random.randint(self.stride_range[0], max_stride)
+            t = random.randint(0, len(frames) - stride - 1)
+            img0 = cv2.imread(frames[t])
+            gt = cv2.imread(frames[t + stride // 2])
+            img1 = cv2.imread(frames[t + stride])
+            return img0, gt, img1
 
     def aug(self, img0, gt, img1, h, w):
         ih, iw, _ = img0.shape
@@ -113,6 +157,13 @@ class MixedDataset(Dataset):
         
         # Total weight
         self.total_weight = sum(ratio)
+        
+        # Dynamic X4K probability (updated by sigmoid schedule)
+        self.x4k_prob = ratio[1] / self.total_weight
+
+    def set_x4k_prob(self, prob):
+        """Update X4K sampling probability (for sigmoid curriculum)."""
+        self.x4k_prob = max(0.0, min(1.0, prob))
 
     def __len__(self):
         # Use max of weighted lengths to ensure all data is covered
@@ -120,13 +171,7 @@ class MixedDataset(Dataset):
         return max(self.v_len, int(self.x_len * v_w / max(x_w, 1)))
 
     def __getitem__(self, index):
-        # Sample based on ratio
-        v_weight, x_weight = self.ratio
-        if v_weight == 0:
-            return self.x4k[random.randint(0, self.x_len - 1)]
-        elif x_weight == 0:
-            return self.vimeo[random.randint(0, self.v_len - 1)]
-        elif random.random() < (x_weight / self.total_weight):
+        if random.random() < self.x4k_prob:
             return self.x4k[random.randint(0, self.x_len - 1)]
         else:
             return self.vimeo[random.randint(0, self.v_len - 1)]

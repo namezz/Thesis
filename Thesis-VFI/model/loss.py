@@ -197,30 +197,30 @@ class FlowSmoothnessLoss(nn.Module):
 
 class CompositeLoss(nn.Module):
     """
-    Phase-aware composite loss for VFI training.
+    Phase-aware composite loss for VFI training (VGG-free).
     
-    Phase 1: LapLoss(Charb) + Ternary + VGG (backbone-only, no flow)
-    Phase 2: LapLoss(Charb) + Ternary(scheduled) + VGG(L2norm) + FlowSmoothness
+    Phase 1: LapLoss(Charb) + Ternary (backbone-only, no flow)
+    Phase 2: LapLoss(Charb) + Ternary(scheduled) + FlowSmoothness
     Phase 3: Same as Phase 2 (4K fine-tune)
     
     Loss weights (SOTA-aligned):
     - LapLoss(Charb): 1.0 (primary, smooth gradient near optimum)
     - Ternary: 0→0.5 warmup over epochs 10~30 (Phase 2), 1.0 (Phase 1)
-    - VGG:    0.005 (perceptual, L2-normalized features)
     - FlowSmooth: 20.0 (Phase 2+, target ~1-5% contribution)
+    
+    VGG removed: saves ~2GB VRAM from activation maps, eliminates
+    4.4x gradient swing from static-image features conflicting with VFI dynamics.
     """
-    def __init__(self, phase=1, w_lap=1.0, w_ter=1.0, w_vgg=0.005, w_flow_smooth=20.0):
+    def __init__(self, phase=1, w_lap=1.0, w_ter=1.0, w_flow_smooth=20.0):
         super(CompositeLoss, self).__init__()
         self.phase = phase
         self.w_lap = w_lap
         self.w_ter_max = w_ter if phase == 1 else 0.5
-        self.w_vgg = w_vgg
         self.w_flow_smooth = w_flow_smooth
         self.current_epoch = 0
         
         self.lap_loss = LapLoss()
         self.ternary_loss = Ternary()
-        self.vgg_loss = VGGPerceptualLoss()
         if phase >= 2:
             self.flow_smooth_loss = FlowSmoothnessLoss()
     
@@ -245,15 +245,13 @@ class CompositeLoss(nn.Module):
         """
         loss_lap = self.lap_loss(pred, gt)
         loss_ter = self.ternary_loss(pred, gt)
-        loss_vgg = self.vgg_loss(pred, gt)
         
         w_ter = self._get_ternary_weight()
-        total = self.w_lap * loss_lap + w_ter * loss_ter + self.w_vgg * loss_vgg
+        total = self.w_lap * loss_lap + w_ter * loss_ter
         
         loss_dict = {
             'loss_lap': loss_lap.item(),
             'loss_ter': loss_ter.item(),
-            'loss_vgg': loss_vgg.item(),
             'w_ter': w_ter,
         }
         
