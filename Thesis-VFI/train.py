@@ -13,7 +13,7 @@ from dataset import VimeoDataset, X4KDataset, MixedDataset
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data.distributed import DistributedSampler
-from config import MODEL_CONFIG, PHASE1_CONFIG, PHASE2_CONFIG, PHASE2_CG_CONFIG, PHASE3_CONFIG, ABLATION_CONFIGS, init_model_config, PHASE1_V2_CONFIG, PHASE2_V2_CONFIG
+from config import MODEL_CONFIG, PHASE1_CONFIG, PHASE2_CONFIG, PHASE2_CG_CONFIG, PHASE3_CONFIG, ABLATION_CONFIGS, init_model_config, PHASE1_V2_CONFIG, PHASE2_V2_CONFIG, PHASE1_V3_CONFIG, PHASE2_V3_CONFIG
 from benchmark.utils.pytorch_msssim import ssim_matlab
 
 device = torch.device("cuda")
@@ -214,6 +214,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_mhc', action='store_true', help='Use Manifold Hyper-Connections')
     parser.add_argument('--use_ecab', action=argparse.BooleanOptionalAction, default=True, help='Use ECAB (default: True, --no-use_ecab to disable)')
     parser.add_argument('--backbone_v2', action='store_true', help='Use V2 backbone (Factorized SSM + CrossGating)')
+    parser.add_argument('--backbone_v3', action='store_true', help='Use V3 backbone (Factorized SSM + NSS Scan + CrossGating)')
     parser.add_argument('--cross_gating', action='store_true', help='Use CrossGating fusion (V1 backbone upgrade)')
     # Training control
     parser.add_argument('--epochs', type=int, default=300, help='Number of epochs')
@@ -237,9 +238,16 @@ if __name__ == "__main__":
     # Configure MODEL_CONFIG based on phase and arguments
     # =============================================================================
     if args.phase == 1:
-        base_config = (PHASE1_V2_CONFIG if args.backbone_v2 else PHASE1_CONFIG).copy()
+        if args.backbone_v3:
+            base_config = PHASE1_V3_CONFIG.copy()
+        elif args.backbone_v2:
+            base_config = PHASE1_V2_CONFIG.copy()
+        else:
+            base_config = PHASE1_CONFIG.copy()
     elif args.phase == 2:
-        if args.backbone_v2:
+        if args.backbone_v3:
+            base_config = PHASE2_V3_CONFIG.copy()
+        elif args.backbone_v2:
             base_config = PHASE2_V2_CONFIG.copy()
         elif args.cross_gating:
             base_config = PHASE2_CG_CONFIG.copy()

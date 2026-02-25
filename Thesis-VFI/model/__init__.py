@@ -1,5 +1,6 @@
 from .backbone import build_backbone
 from .backbone_v2 import build_backbone_v2
+from .backbone_v3 import build_backbone_v3
 from .flow import build_flow_estimator
 from .refine import RefineNet
 from .warplayer import warp
@@ -53,8 +54,10 @@ class ContextNet(nn.Module):
 class ThesisModel(nn.Module):
     def __init__(self, cfg):
         super(ThesisModel, self).__init__()
-        # Select backbone version: V2 (factorized) or V1 (interleaved)
-        if cfg.get('use_backbone_v2', False):
+        # Select backbone version: V3 (NSS) > V2 (factorized) > V1 (interleaved)
+        if cfg.get('use_backbone_v3', False):
+            self.backbone = build_backbone_v3(cfg)
+        elif cfg.get('use_backbone_v2', False):
             self.backbone = build_backbone_v2(cfg)
         else:
             self.backbone = build_backbone(cfg)

@@ -50,6 +50,17 @@ PHASE1_V2_CONFIG = {
     'USE_X4K_TRAINING': False,
 }
 
+# Phase 1 V3: Factorized SSM + NSS Scan + CrossGating
+PHASE1_V3_CONFIG = {
+    'LOGNAME': 'phase1_nss_v3',
+    'PHASE': 1,
+    'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'),
+                   'use_flow': False, 'use_backbone_v3': True,
+                   'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True},
+    'USE_FLOW': False,
+    'USE_X4K_TRAINING': False,
+}
+
 PHASE2_CONFIG = {
     'LOGNAME': 'phase2_flow',
     'PHASE': 2,
@@ -78,11 +89,23 @@ PHASE2_V2_CONFIG = {
     'USE_X4K_TRAINING': False,
 }
 
+# Phase 2 V3: NSS backbone + flow
+PHASE2_V3_CONFIG = {
+    'LOGNAME': 'phase2_nss_flow',
+    'PHASE': 2,
+    'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'),
+                   'use_flow': True, 'use_backbone_v3': True,
+                   'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True},
+    'USE_FLOW': True,
+    'USE_X4K_TRAINING': False,
+}
+
 PHASE3_CONFIG = {
     'LOGNAME': 'phase3_4k',
     'PHASE': 3,
     'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'),
-                   'use_flow': True, 'use_cross_gating': True, 'use_checkpointing': True},
+                   'use_flow': True, 'use_backbone_v3': True,
+                   'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True},
     'USE_FLOW': True,
     'USE_X4K_TRAINING': True,
 }

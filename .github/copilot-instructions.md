@@ -22,8 +22,8 @@ cd /josh/Thesis/Thesis-VFI
 
 ```bash
 # Dry run（1 epoch 快速驗證）
-torchrun --nproc_per_node=1 train.py --batch_size 2 \
-    --data_path /josh/dataset/vimeo90k/vimeo_triplet --phase 1 --dry_run
+torchrun --nproc_per_node=1 train.py --batch_size 6 \
+    --data_path /josh/dataset/vimeo90k/vimeo_triplet --phase 1 --backbone_v3 --dry_run
 
 # Unit test（2 training steps + 1 eval + checkpoint save）
 python unit_test_train.py
@@ -43,8 +43,8 @@ python benchmark/Vimeo90K.py --model <ckpt_name> --path /josh/dataset/vimeo90k/v
 
 | Phase | 訓練內容 | Flow | 資料集 | 主要目標 |
 |-------|---------|------|--------|---------|
-| 1 | HybridBackbone + RefineNet | 無 | Vimeo90K | Vimeo90K PSNR ≥ 34.5 dB |
-| 2 | + OpticalFlowEstimator + ContextNet + CrossGating | 有 | Vimeo90K + X4K (4:1) | SNU-FILM Hard ≥ 30.0 dB |
+| 1 | HybridBackbone V3 (NSS+CrossGating) + RefineNet | 無 | Vimeo90K | Vimeo90K PSNR ≥ 34.5 dB |
+| 2 | + OpticalFlowEstimator + ContextNet | 有 | Vimeo90K + X4K (4:1) | SNU-FILM Hard ≥ 30.0 dB |
 | 3 | 全模型 + Sigmoid Curriculum Learning | 有 | Vimeo90K + X4K (sigmoid schedule) | X-TEST 4K ≥ 30.0 dB |
 
 階段轉換用 `--resume` 載入前階段 checkpoint，`--freeze_backbone N` 凍結 backbone N epochs。
@@ -83,16 +83,24 @@ Phase 2 訓練 FlowEstimator 時提早引入少量 X4K 資料（`--mixed_ratio 4
 - **Phase 3 512 crop OOM**：降 batch=2 或 `--grad_accum 2`
 - **4K 推理 OOM**：使用 `--scale 0.25` 或 `model.hr_inference(scale=0.25)`
 
-### LGS Block（核心模組，`model/backbone.py`）
+### LGS Block V3（核心模組，`model/backbone_v3.py`，預設）
 
-- **Branch A**: Mamba2 SSD + 4-direction spatial SS2D scan + temporal cross-fusion MLP — 全域跨幀時序掃描
+- **Branch A**: Factorized SSM — per-frame spatial Mamba2 with NSS (Nested S-shaped Scan, MaIR CVPR 2025) + temporal MLP cross-fusion — 四方向嵌套 S 型掃描保留空間局部性
 - **Branch B**: Gated Window Attention (FlashAttention-2) — 局部紋理
-- **Fusion**: CrossGatingFusion（雙向 Conv2d 交叉門控，`--cross_gating`）或 ECAB + 可選 mHC 殘差混合
+- **Fusion**: CrossGatingFusion（雙向 Conv2d 交叉門控，內建於 V3）
+- **Shift-Stripe**: 交替 block 偏移 stripe 邊界 (類似 Swin shifted window)
 - **Gradient Checkpointing**: 包裝 Mamba2 SSD forward，節省 ~20% VRAM
+- **Learnable Frame Merge**: concat + 1×1 Conv 取代 naive sum（保留幀間差異資訊）
+
+### LGS Block V1（`model/backbone.py`，legacy）
+
+- **Branch A**: Mamba2 SSD + 4-direction spatial SS2D scan + temporal cross-fusion MLP
+- **Branch B**: Gated Window Attention (FlashAttention-2)
+- **Fusion**: CrossGatingFusion（`--cross_gating`）或 ECAB + 可選 mHC 殘差混合
 
 ### V2 Backbone（`model/backbone_v2.py`，ablation study）
 
-Factorized SSM：per-frame spatial Mamba2 (HW sequence) + symmetric temporal MLP fusion。VRAM 大幅降低（batch=4: 7.5 GB vs V1 22.1 GB），但實測 Mamba2 為 O(N) memory，效能差異主要來自少了多方向掃描。V1 4-direction scan 為預設（與 VFIMamba 設計一致）。
+Factorized SSM：per-frame spatial Mamba2 (HW sequence) + symmetric temporal MLP fusion。V2 是 V3 的前身原型，不含 NSS scan 和 CrossGating，僅用於消融實驗。
 
 ### Model Forward（`model/__init__.py`）
 
@@ -104,7 +112,7 @@ Factorized SSM：per-frame spatial Mamba2 (HW sequence) + symmetric temporal MLP
 
 ### Config 系統（`config.py`）
 
-`MODEL_CONFIG` 是 flat dict，runtime 從 `PHASE_CONFIGS[phase]` 與 `ABLATION_CONFIGS[exp_name]` 合併更新。CLI args 優先。消融實驗均為預定義 dict（如 `exp_ablation_mamba2_only`）。新增 `PHASE1_V2_CONFIG`（Factorized SSM）、`PHASE2_CG_CONFIG`（CrossGating）、`PHASE2_V2_CONFIG` 等配置變體。
+`MODEL_CONFIG` 是 flat dict，runtime 從 `PHASE_CONFIGS[phase]` 與 `ABLATION_CONFIGS[exp_name]` 合併更新。CLI args 優先。新增 `PHASE1_V3_CONFIG`、`PHASE2_V3_CONFIG`（NSS + CrossGating + 自適應損失）。使用 `--backbone_v3` 啟用 V3 backbone。
 
 ### Trainer 模式（`Trainer.py`）
 
@@ -117,7 +125,7 @@ Factorized SSM：per-frame spatial Mamba2 (HW sequence) + symmetric temporal MLP
 
 ### Loss（`model/loss.py`）
 
-`CompositeLoss` 組件（VGG-free）：LapLoss(Charbonnier, w=1.0) + Ternary (w=1.0 Phase 1; w=0→0.5 warmup Phase 2+) + FlowSmoothnessLoss (w=20.0, Phase 2+ only)。VGG 已移除（節省 ~2GB VRAM，消除 4.4× 梯度震盪）。各組件獨立記錄到 TensorBoard。
+`CompositeLoss` 使用 uncertainty-based adaptive weighting (Kendall et al., CVPR 2018)：每個 loss 組件有可學習的 `log_var` 參數，自動平衡權重。組件：LapLoss(Charbonnier) + Ternary(Census) + FlowSmoothnessLoss (Phase 2+)。VGG-free。Loss 參數已加入 optimizer 的 'other' param group。各組件權重 (`w_lap`, `w_ter`, `w_flow`) 記錄到 TensorBoard。
 
 ### Tensor Shapes
 

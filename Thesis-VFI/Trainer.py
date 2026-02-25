@@ -25,10 +25,12 @@ class Model:
         backbone_params = list(self.net.backbone.parameters())
         backbone_ids = set(id(p) for p in backbone_params)
         other_params = [p for p in self.net.parameters() if id(p) not in backbone_ids]
+        # Include adaptive loss weight parameters (log_var_*)
+        loss_params = list(self.loss_fn.parameters())
         
         self.optimG = AdamW([
             {'params': backbone_params, 'lr': 2e-4 * backbone_lr_scale, 'name': 'backbone'},
-            {'params': other_params, 'lr': 2e-4, 'name': 'other'},
+            {'params': other_params + loss_params, 'lr': 2e-4, 'name': 'other'},
         ], weight_decay=1e-4)
         
         # AMP: BF16 has same exponent range as FP32, no overflow risk

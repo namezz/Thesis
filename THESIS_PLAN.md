@@ -13,13 +13,15 @@
 | **RIFE** | ECCV 2022 | Convolution | 高 | 低 |
 | **EMA-VFI** | CVPR 2023 | Local Attention + CNN | 高 | 中 |
 | **VFIMamba** | NeurIPS 2024 | Pure SSM (Mamba1) | 依賴 CAB | 低 |
-| **Ours (Thesis)** | -- | **Mamba2 + Gated Window Attention** | **Transformer + ECAB** | 低~中 |
+| **Ours (Thesis)** | -- | **Mamba2 NSS + Gated Window Attention** | **CrossGating + Adaptive Loss** | 低~中 |
 
 **核心創新點**：
 
-1. **Mamba2 (SSD) + Interleaved SS2D**：使用 Mamba2 的 SSD 演算法 (ICML 2024, arXiv:2405.21060, Gu & Dao) 提升表達能力，並採用 VFIMamba 風格的 **Interleaved SS2D** 掃描策略（見 §3.4），將兩幀 token 交錯排列成單一序列，使 SSM 遞迴狀態能自然攜帶跨幀時序資訊。
-2. **Gated Window Attention**：借鑒 Qwen 團隊研究 (arXiv:2505.06708, Qiu et al., 2025)，在 Window Attention 輸出後加入 head-specific sigmoid gate `Y' = sigma(X * W_g) * Y`，消除 attention sink 並提升穩定性。
-3. **mHC (Manifold-Constrained Hyper-Connections)**：使用 DeepSeek 團隊 (arXiv, Xie et al., Dec 2025) 提出的技術，穩定 Mamba 與 Attention 雙流之間的殘差混合。可選用 mHC-lite (Yang & Gao, Jan 2026) 簡化版本降低訓練開銷。
+1. **Mamba2 (SSD) + NSS (Nested S-shaped Scan)**：使用 Mamba2 的 SSD 演算法 (ICML 2024) 提升表達能力，採用 MaIR (CVPR 2025) 提出的 **Nested S-shaped Scan** 取代傳統 4-direction flip scan，透過條帶內 S 型 boustrophedon 走訪保留空間局部性，搭配 shift-stripe（類似 Swin shifted window）擴大感受野。
+2. **Factorized Spatio-Temporal SSM**：參考 LC-Mamba (AAAI 2025) 的設計，將空間與時序處理分離——per-frame spatial Mamba2 + symmetric temporal MLP fusion，避免跨幀 token interleave 的長序列問題。
+3. **CrossGatingFusion**：借鑒 Ren et al. (CVPR 2022)，使用雙向 Conv2d 交叉門控取代簡單加法或 ECAB 融合 Mamba 與 Attention 雙流特徵。
+4. **Uncertainty-based Adaptive Loss**：基於 Kendall et al. (CVPR 2018) 的多任務不確定性加權，每個 loss 組件有可學習的精度參數，自動平衡權重。
+5. **Gated Window Attention**：借鑒 Qwen 團隊研究 (arXiv:2505.06708, Qiu et al., 2025)，在 Window Attention 輸出後加入 head-specific sigmoid gate。
 
 ---
 
@@ -62,22 +64,27 @@ MaTVLM 使用**自定義 Mamba2** (新增 `d_xb` 參數使 x/B 維度 = Attentio
   - **方案 B (修改 Mamba2 config)**：調整 `expand`, `d_state`, `ngroups` 使維度對齊（如 `expand=1` 使 d_inner==dim）
   - **方案 C (自定義 Mamba2)**：參考 MaTVLM 新增 `d_xb` 參數，使 x/B 維度可獨立設定
 
-### 3.4 VFIMamba-style Interleaved SS2D (NeurIPS 2024, arXiv:2407.02315)
-**概述**：VFIMamba 提出的跨幀交錯掃描策略。與傳統 SS2D（僅對單一特徵圖做 4 方向 flip）不同，此方法在 batch 維度上 concat 兩幀特徵 `[img0, img1]` 形成 `2B` batch，再透過 `merge_x` 將兩幀 token 交錯排列成長度為 `2×H×W` 的序列。
+### 3.4 掃描策略演進
 
-**核心優勢**：
-  - SSM 的遞迴狀態在處理序列時，會交替看到 frame0 和 frame1 的 token，自然實現**跨幀時序資訊融合**
-  - 相比在 channel 維度 concat 兩幀（`6ch → backbone`），batch-concat + interleave 能讓每個 SSM head 獨立建立兩幀之間的對應關係
-  - 4 個掃描方向：H→W、W→H（轉置）、及其各自的反向，確保空間覆蓋
+#### V1: VFIMamba-style Interleaved SS2D (NeurIPS 2024)
+**概述**：VFIMamba 提出的跨幀交錯掃描策略。batch-concat 兩幀後 merge_x 交錯排列成 `2×H×W` 序列，4 方向掃描。SSM 遞迴狀態交替看到兩幀 token，自然實現跨幀時序融合。已改用 snake scan (S-shaped boustrophedon) 取代 naive raster scan 以保留空間局部性。
 
-**本專案實作**（見 `model/utils.py`）：
-  - `interleaved_scan(x)`: `(2B, H, W, C)` → `(4B, 2*H*W, C)` — 交錯掃描
-  - `interleaved_merge(x_scan, B, H, W)`: `(4B, 2*H*W, C)` → `(2B, H, W, C)` — 反交錯合併
-  - `HybridBackbone.forward(img0, img1)`: batch-concat 兩幀後送入 LGS Block，最終 sum 兩幀特徵
+#### V3: NSS — Nested S-shaped Scan (MaIR, CVPR 2025) ← 目前預設
+**概述**：V3 backbone 採用 Factorized Spatio-Temporal 架構，空間掃描使用 NSS：
+- 將 feature map 分割為 `stripe_width` 寬的條帶
+- 每條帶內以 S 型 (boustrophedon) 走訪，保留空間鄰近性
+- 4 個掃描方向：h_fwd / h_bwd / v_fwd / v_bwd
+- **Shift-stripe**: 交替 block 偏移條帶邊界 `stripe_width // 2`（類似 Swin shifted window），跨越條帶邊界擴大感受野
+- 掃描 index 使用 `@lru_cache` 快取，避免重複計算
 
-**記憶體注意**：因序列長度加倍且 batch 加倍，VRAM 使用量較傳統 SS2D 增加約 2-3x。
-  - RTX 5090 32GB: batch_size <= 4 (256x256 crop, 實測 ~25.6GB)
-  - A100 80GB: batch_size <= 16-24
+**本專案實作**（見 `model/backbone_v3.py`）：
+  - `NSScan` class: 管理 NSS 索引生成、scatter/gather 操作
+  - `FactorizedSSMBlock`: per-frame Mamba2 spatial + temporal MLP cross-fusion
+  - `LGSBlockV3`: Factorized SSM (Branch A) + Gated Window Attention (Branch B) + CrossGatingFusion
+
+**記憶體對比**：V3 (batch=6) ~28 GB vs V1 (batch=4) ~22 GB，V3 在相同 VRAM 下可使用更大 effective batch size。
+  - RTX 5090 32GB: V3 batch=6 (28 GB, grad_accum=2 → effective batch=12)
+  - A100 80GB: V3 batch≈16-24 (estimated)
 
 ---
 
@@ -85,17 +92,18 @@ MaTVLM 使用**自定義 Mamba2** (新增 `d_xb` 參數使 x/B 維度 = Attentio
 
 ### 第一階段：混合式骨幹驗證 (Phase 1: Hybrid Backbone Baseline)
 
-#### 4.1.1 核心架構：LGS Block
-- **Branch A**: Mamba2 SSD + Interleaved SS2D (跨幀交錯 4-direction Scan)
+#### 4.1.1 核心架構：LGS Block V3
+- **Branch A**: Factorized SSM — per-frame spatial Mamba2 (NSS 4-direction scan) + temporal MLP cross-fusion
 - **Branch B**: Gated Window Attention (FlashAttention-2)
-- **Fusion**: ECAB (Efficient Channel Attention) + mHC Mixing (optional)
+- **Fusion**: CrossGatingFusion（雙向交叉門控）
+- **Shift-Stripe**: 交替 block 偏移 stripe 邊界
 
 #### 4.1.2 整體 Pipeline
 ```
-I_0, I_1 --[batch concat]--> CNN Stem (3ch) --> Multi-scale LGS Backbone --> 
-    Mamba: interleaved cross-frame scan
+I_0, I_1 --[batch concat]--> CNN Stem (3ch) --> Multi-scale LGS V3 Backbone -->
+    Mamba: per-frame NSS spatial scan + temporal MLP fusion
     Attn:  per-frame window attention
---> frame0 + frame1 feature sum --> RefineNet (Residual + Mask) --> I_t
+--> concat + 1×1 conv (learnable frame merge) --> RefineNet (Residual + Mask) --> I_t
 ```
 
 #### 4.1.3 訓練配置
@@ -104,13 +112,13 @@ I_0, I_1 --[batch concat]--> CNN Stem (3ch) --> Multi-scale LGS Backbone -->
 | 訓練資料 | Vimeo90K Triplet (im1/im2/im3 → 51,313 train / 3,782 test) |
 | Optimizer | AdamW, lr=2e-4, weight_decay=1e-4 |
 | LR Schedule | Linear warmup 2000 steps → Cosine decay to 2e-5 |
-| Batch Size | **4 (RTX 5090 32GB, ~25.6GB VRAM)** / **16-24 (A100 80GB)** |
+| Batch Size | **6 (RTX 5090 32GB, ~28GB VRAM) + grad_accum=2 → effective batch=12** |
 | Hardware | **1x RTX 5090 32GB (Blackwell, SM 12.0)** |
-| Precision | AMP (Mamba2 core in FP32 — Triton SSD kernel 不支援 FP16) |
-| Loss | CompositeLoss: LapLoss (w=1.0) + Ternary (w=1.0) + VGG (w=0.005) |
+| Precision | BF16 AMP (RTX 5090 native support; Mamba2 core in FP32 — Triton SSD kernel) |
+| Loss | CompositeLoss: Adaptive weighting (Kendall et al.) — LapLoss + Ternary |
+| Backbone | **V3 (Factorized SSM + NSS scan + CrossGating)**, 1.52M params |
 | Epochs | 300 |
 | Eval 頻率 | 每 3 個 epoch 評估一次 Vimeo90K test set (PSNR/SSIM) |
-| 速度 | ~3.67 it/s, ~58 min/epoch (RTX 5090, batch=4) |
 
 #### 4.1.4 訓練指令
 
@@ -125,46 +133,20 @@ cd /josh/Thesis/Thesis-VFI
 # Step 0: 快速驗證 Pipeline (Dry Run)
 # ============================================================
 torchrun --nproc_per_node=1 train.py \
-    --batch_size 4 \
+    --batch_size 6 \
     --data_path /josh/dataset/vimeo90k/vimeo_triplet \
-    --phase 1 --dry_run
+    --phase 1 --backbone_v3 --dry_run
 
 # ============================================================
-# Step 1: Phase 1 主實驗 (Exp-1c: Hybrid LGS Block)
+# Step 1: Phase 1 主實驗 (V3 NSS Backbone)
 # ============================================================
-# RTX 5090 32GB (batch=4, ~25.6GB VRAM, ~3.67 it/s)
+# RTX 5090 32GB (batch=6 ~28GB, grad_accum=2, effective batch=12)
 nohup torchrun --nproc_per_node=1 train.py \
-    --batch_size 4 \
+    --batch_size 6 --grad_accum 2 \
     --data_path /josh/dataset/vimeo90k/vimeo_triplet \
-    --phase 1 --epochs 300 --eval_interval 3 \
+    --phase 1 --backbone_v3 --epochs 300 --eval_interval 3 \
     --num_workers 8 \
-    --exp_name phase1_hybrid_v2 > train_phase1_v2.log 2>&1 &
-
-# ============================================================
-# Step 2: Phase 1 Ablation Studies (100 epochs each)
-# ============================================================
-# Exp-1a: Pure Mamba2 only (no attention)
-nohup torchrun --nproc_per_node=1 train.py \
-    --batch_size 4 \
-    --data_path /josh/dataset/vimeo90k/vimeo_triplet \
-    --phase 1 --epochs 100 \
-    --backbone_mode mamba2_only --exp_name exp1a_mamba2_only \
-    > train_exp1a.log 2>&1 &
-
-# Exp-1b: Pure Gated Attention only (no SSM)
-nohup torchrun --nproc_per_node=1 train.py \
-    --batch_size 4 \
-    --data_path /josh/dataset/vimeo90k/vimeo_triplet \
-    --phase 1 --epochs 100 \
-    --backbone_mode gated_attn_only --exp_name exp1b_gated_attn_only \
-    > train_exp1b.log 2>&1 &
-
-# Exp-1f: ECAB vs CAB (channel attention)
-nohup torchrun --nproc_per_node=1 train.py \
-    --batch_size 4 \
-    --data_path /josh/dataset/vimeo90k/vimeo_triplet \
-    --phase 1 --epochs 100 \
-    --no-use_ecab --exp_name exp1f_cab_baseline \
+    --exp_name phase1_nss_v3 > train_phase1_v3.log 2>&1 &
     > train_exp1f.log 2>&1 &
 
 # Exp-1h: mHC Manifold Residual
@@ -220,8 +202,8 @@ python benchmark/MiddleBury_Other.py --model phase1_hybrid_v2_best --path /josh/
 | 15 | 33.64 | 0.9652 | ~0.022 | 進行中 |
 | 300 (預估) | 34.5~35.5 | ~0.975 | -- | 目標 |
 
-模型參數量：1.26M (Phase 1 backbone + RefineNet)
-VRAM: 25.6GB (RTX 5090, batch=4, 256x256 crop)
+模型參數量：1.52M (V3 backbone + RefineNet)
+VRAM: ~28GB (RTX 5090, batch=6, 256x256 crop, grad_accum=2)
 
 ---
 
@@ -231,7 +213,7 @@ VRAM: 25.6GB (RTX 5090, batch=4, 256x256 crop)
 #### 4.2.1 核心改進
 - **Flow Module**: 輕量級 3-scale 光流估計器 (參考 IFNet/RIFE)，輸出雙向光流 `(B, 4, H, W)` + 融合 mask `(B, 1, H, W)`。**Timestep-aware**：timestep 作為額外輸入通道 (block0: 7ch, block1/2: 18ch)，讓網路學習時間相依的光流模式。支援 `scale_list` 參數，可在高解析度推理時使用 `[8,4,2]` 替代 `[4,2,1]`。
 - **ContextNet (RIFE/VFIMamba-style)**: 每幀獨立的多尺度特徵提取器 (`3ch → c → 2c → 4c`)，提取的特徵使用光流進行 warp，為 RefineNet 提供對齊的上下文資訊。每個尺度使用對應下採樣的光流進行 warping。
-- **Backbone 處理原始幀**: 與 Phase 1 相同，backbone 處理**未 warped 的原始幀**，讓 Interleaved SS2D 的跨幀掃描在原始內容上進行時序融合。光流 warped 的特徵由 ContextNet 獨立提供。
+- **Backbone 處理原始幀**: 與 Phase 1 相同，backbone 處理**未 warped 的原始幀**，讓 Factorized SSM 的 NSS 空間掃描在原始內容上進行時序融合。光流 warped 的特徵由 ContextNet 獨立提供。
 - **RefineNet (use_context=True)**: 接收 backbone 多尺度特徵 + ContextNet warped 特徵，在每個尺度上 concat 後解碼。光流 mask 與精煉 mask 結合 `sigmoid(flow_mask + refine_mask)`，由兩個模組共同決定融合權重。
 - **Freeze-then-Unfreeze**: 前 50 個 epoch 凍結 backbone，僅訓練 flow estimator、ContextNet 與 RefineNet，避免破壞 Phase 1 學到的表徵
 - **Warplayer 優化**: Grid cache 以 `(device, H, W)` 為 key（不含 batch），batch=1 建立 grid 後由 `grid_sample` 自動 broadcast
@@ -257,7 +239,7 @@ feats + ctx0 + ctx1 --> RefineNet (use_context=True) --> residual + refine_mask
 - Flow Estimator: ~6.82M params
 - ContextNet ×2: ~0.57M params
 - RefineNet (use_context=True): ~0.56M params
-- Backbone: ~1.24M params (from Phase 1)
+- Backbone: ~1.52M params (V3, from Phase 1)
 - **Total: ~9.0M params**
 
 **VRAM 使用量** (256x256 crop, AMP):
@@ -572,7 +554,9 @@ python benchmark/TimeTest.py --model exp3d_curriculum_best --resolution 4k
 
 ### 5.1 設計理念
 
-根據對所有參考 VFI 專案的損失函式分析，本專案採用 **CompositeLoss** — 一個階段感知的複合損失，根據訓練階段自動組合不同的損失組件。
+本專案採用 **CompositeLoss** 搭配 **uncertainty-based adaptive weighting** (Kendall et al., CVPR 2018)。每個 loss 組件配有可學習的精度參數 `log_var`，訓練過程中自動平衡各組件權重，無需手動調整。
+
+**公式**：`L_total = Σ (exp(-log_var_i) × L_i + log_var_i)`
 
 **參考分析**：
 
@@ -583,51 +567,42 @@ python benchmark/TimeTest.py --model exp3d_curriculum_best --resolution 4k
 | IFRNet | Charbonnier + Ternary + Geometry + flow supervision | Ternary 在 3/4 的 SOTA VFI 中使用 |
 | VFIMamba | LapLoss only | 僅靠架構，loss 最簡 |
 
-**關鍵發現**：Ternary (Census) Loss 被 RIFE、EMA-VFI、IFRNet 三個頂級 VFI 方法採用，但之前我們的實作雖然有 Ternary 類別，卻**從未在訓練中使用過**。
+### 5.2 CompositeLoss 組成（VGG-free + Adaptive Weighting）
 
-### 5.2 CompositeLoss 組成
-
-```python
-CompositeLoss(phase=N, w_lap=1.0, w_ter=1.0, w_vgg=0.005, w_flow_smooth=0.1)
-```
-
-| 組件 | 權重 | 階段 | 來源 | 說明 |
+| 組件 | 初始權重 | 階段 | 來源 | 說明 |
 | :--- | :--- | :--- | :--- | :--- |
-| **LapLoss** | 1.0 | 1, 2, 3 | RIFE/VFIMamba/EMA-VFI | 多尺度頻率分解 L1，VFI 標準 |
-| **Ternary** | 1.0 | 1, 2, 3 | RIFE/EMA-VFI/IFRNet | 捕捉局部結構模式，對光照變化魯棒 |
-| **VGG Perceptual** | 0.005 | 1, 2, 3 | RIFE | 感知品質，權重保守以避免幻影偽影 |
-| **FlowSmoothness** | 0.1 | 2, 3 | IFRNet inspired | 邊緣感知光流正則化 (edge-aware) |
+| **LapLoss (Charbonnier)** | adaptive | 1, 2, 3 | RIFE/VFIMamba/EMA-VFI | 多尺度頻率分解，Charbonnier 核近最優時梯度平滑 |
+| **Ternary (Census)** | adaptive | 1, 2, 3 | RIFE/EMA-VFI/IFRNet | 捕捉局部結構模式，對光照變化魯棒 |
+| **FlowSmoothness** | adaptive | 2, 3 | IFRNet inspired | 邊緣感知光流正則化 (edge-aware) |
+
+**VGG Perceptual Loss 已移除**：節省 ~2GB VRAM，消除靜態圖像特徵與 VFI 動態的梯度衝突（實測 4.4× gradient swing）。
+
+**Adaptive weighting 實作**：`log_var_lap`, `log_var_ter`, `log_var_flow` 為 `nn.Parameter`，加入 optimizer 的 'other' param group。TensorBoard 記錄有效權重 `w_lap = exp(-log_var_lap)`, `w_ter`, `w_flow`。
 
 ### 5.3 各階段損失組態
 
-- **Phase 1** (Backbone Only): `L_total = 1.0×LapLoss + 1.0×Ternary + 0.005×VGG`
-  - 不含 flow，純粹驗證 backbone 品質
-- **Phase 2** (Flow Guidance): `L_total = 1.0×LapLoss + 1.0×Ternary + 0.005×VGG + 0.1×FlowSmooth`
-  - 新增 FlowSmoothnessLoss，防止光流雜訊並允許邊界清晰
+- **Phase 1** (Backbone Only): `L = exp(-s_l)×LapLoss + s_l + exp(-s_t)×Ternary + s_t`
+  - 不含 flow，純粹驗證 backbone 品質；自動學習 LapLoss 與 Ternary 的最佳比例
+- **Phase 2** (Flow Guidance): 新增 FlowSmoothnessLoss 組件（自適應權重）
 - **Phase 3** (4K Fine-tune): 同 Phase 2
-  - 保持相同 loss 配比，專注於解析度提升
 
 ### 5.4 技術細節
 
 - **Ternary AMP 相容性**：使用 `register_buffer('w', ...)` 而非建構子 `device` 參數。AMP 下輸入為 FP16 時，以 `.to(dtype=tensor_.dtype)` 確保 conv2d 核型別匹配。
 - **FlowSmoothnessLoss**：使用影像梯度作為邊緣權重 `exp(-|∇img|)`，在物體邊緣處允許光流不連續，平坦區域則鼓勵平滑。
-- **TensorBoard 記錄**：每個 loss 組件獨立記錄 (`loss/loss_lap`, `loss/loss_ter`, `loss/loss_vgg`, `loss/loss_flow_smooth`, `loss/loss_total`)，便於分析各組件貢獻。
-- **Model Forward**：`ThesisModel.forward()` 回傳 `(pred, flow)` 或 `(pred, None)`，使 Trainer 能將 flow 傳遞給 FlowSmoothnessLoss。
+- **TensorBoard 記錄**：各組件 loss 值 + 自適應權重 (`loss/loss_lap`, `loss/loss_ter`, `loss/w_lap`, `loss/w_ter` 等)。
+- **Loss 參數最佳化**：loss_fn.parameters() 已加入 Trainer optimizer 的 'other' param group，與非 backbone 參數共享 learning rate。
 
 ### 5.5 損失函式消融實驗 (建議)
 
-- **Exp-1j**: Loss 組件消融 — 比較不同 loss 組合對 Phase 1 PSNR 的影響
-  - (a) LapLoss only (VFIMamba baseline)
-  - (b) LapLoss + VGG (原始設定)
-  - (c) LapLoss + Ternary (EMA-VFI 風格)
-  - (d) LapLoss + Ternary + VGG (本專案設定)
-  - 預期：(d) ≥ (c) > (b) > (a)
+- **Exp-loss-a**: Fixed weight vs Adaptive (uncertainty-based) — 驗證自適應加權的效果
+- **Exp-loss-b**: LapLoss only vs LapLoss + Ternary (adaptive) — 驗證 Ternary 貢獻
 
 ### 5.6 潛在未來擴展
 
 - **Geometry Loss** (IFRNet): 在多尺度中間特徵上計算一致性損失，需要 backbone 輸出中間特徵
 - **Flow Distillation** (RIFE): 用預訓練的高精度光流模型 (如 FlowFormer++) 做 teacher-student 監督
-- **SSIM Loss**: 直接最大化結構相似性指標
+- **LPIPS Distillation**: 預訓練 VGG 做 teacher → lightweight MLP student，低 VRAM 取得感知品質
 
 ---
 

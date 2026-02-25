@@ -199,39 +199,29 @@ class CompositeLoss(nn.Module):
     """
     Phase-aware composite loss for VFI training (VGG-free).
     
-    Phase 1: LapLoss(Charb) + Ternary (backbone-only, no flow)
-    Phase 2: LapLoss(Charb) + Ternary(scheduled) + FlowSmoothness
+    Uses uncertainty-based adaptive weighting (Kendall et al., CVPR 2018):
+        L = (1/2σ²)L_i + log(σ)  per component
+    Each σ is a learnable parameter that auto-balances loss contributions.
+    
+    Phase 1: LapLoss(Charb) + Ternary
+    Phase 2: LapLoss(Charb) + Ternary + FlowSmoothness
     Phase 3: Same as Phase 2 (4K fine-tune)
-    
-    Loss weights (SOTA-aligned):
-    - LapLoss(Charb): 1.0 (primary, smooth gradient near optimum)
-    - Ternary: 0→0.5 warmup over epochs 10~30 (Phase 2), 1.0 (Phase 1)
-    - FlowSmooth: 20.0 (Phase 2+, target ~1-5% contribution)
-    
-    VGG removed: saves ~2GB VRAM from activation maps, eliminates
-    4.4x gradient swing from static-image features conflicting with VFI dynamics.
     """
-    def __init__(self, phase=1, w_lap=1.0, w_ter=1.0, w_flow_smooth=20.0):
+    def __init__(self, phase=1):
         super(CompositeLoss, self).__init__()
         self.phase = phase
-        self.w_lap = w_lap
-        self.w_ter_max = w_ter if phase == 1 else 0.5
-        self.w_flow_smooth = w_flow_smooth
-        self.current_epoch = 0
         
         self.lap_loss = LapLoss()
         self.ternary_loss = Ternary()
         if phase >= 2:
             self.flow_smooth_loss = FlowSmoothnessLoss()
-    
-    def _get_ternary_weight(self):
-        """Dynamic Ternary weight: Phase 1 = fixed, Phase 2 = warmup schedule."""
-        if self.phase == 1:
-            return self.w_ter_max
-        # Phase 2+: 0 for epoch<10, linear ramp to w_ter_max by epoch 30
-        if self.current_epoch < 10:
-            return 0.0
-        return self.w_ter_max * min(1.0, (self.current_epoch - 10) / 20.0)
+        
+        # Learnable log-variance parameters (Kendall et al.)
+        # Initialize: log(σ²) = 0 → σ² = 1 → weight = 0.5
+        self.log_var_lap = nn.Parameter(torch.zeros(1))
+        self.log_var_ter = nn.Parameter(torch.zeros(1))
+        if phase >= 2:
+            self.log_var_flow = nn.Parameter(torch.zeros(1))
     
     def forward(self, pred, gt, flow=None, img0=None):
         """
@@ -246,19 +236,27 @@ class CompositeLoss(nn.Module):
         loss_lap = self.lap_loss(pred, gt)
         loss_ter = self.ternary_loss(pred, gt)
         
-        w_ter = self._get_ternary_weight()
-        total = self.w_lap * loss_lap + w_ter * loss_ter
+        # Uncertainty-based adaptive weighting: L_total = Σ (1/(2σ_i²)) * L_i + log(σ_i)
+        # Using log-variance parameterization for numerical stability
+        precision_lap = torch.exp(-self.log_var_lap)
+        precision_ter = torch.exp(-self.log_var_ter)
+        
+        total = precision_lap * loss_lap + self.log_var_lap + \
+                precision_ter * loss_ter + self.log_var_ter
         
         loss_dict = {
             'loss_lap': loss_lap.item(),
             'loss_ter': loss_ter.item(),
-            'w_ter': w_ter,
+            'w_lap': precision_lap.item(),
+            'w_ter': precision_ter.item(),
         }
         
         if self.phase >= 2 and flow is not None and img0 is not None:
             loss_flow_smooth = self.flow_smooth_loss(flow, img0)
-            total = total + self.w_flow_smooth * loss_flow_smooth
+            precision_flow = torch.exp(-self.log_var_flow)
+            total = total + precision_flow * loss_flow_smooth + self.log_var_flow
             loss_dict['loss_flow_smooth'] = loss_flow_smooth.item()
+            loss_dict['w_flow'] = precision_flow.item()
         
         loss_dict['loss_total'] = total.item()
         return total, loss_dict

@@ -94,33 +94,65 @@ class ECAB(nn.Module):
         else:
             return x * y.unsqueeze(-1) # (B, C, H, W) * (B, C, 1, 1)
 
+def _snake_flatten(x):
+    """
+    Snake (S-shaped) scan: alternate L→R and R→L per row.
+    Maintains spatial locality by avoiding row-end-to-row-start jumps.
+    Ref: LC-Mamba (CVPR 2025), MaIR (2025)
+    
+    Input: (B, H, W, C)
+    Output: (B, H*W, C)
+    """
+    B, H, W, C = x.shape
+    # Flip odd rows horizontally → snake pattern
+    x_snake = x.clone()
+    x_snake[:, 1::2, :, :] = x_snake[:, 1::2, :, :].flip(2)
+    return x_snake.flatten(1, 2)  # (B, L, C)
+
+
+def _snake_unflatten(x_flat, H, W):
+    """
+    Reverse snake scan: restore original pixel order.
+    Input: (B, H*W, C)
+    Output: (B, H, W, C)
+    """
+    B, L, C = x_flat.shape
+    x_2d = x_flat.view(B, H, W, C).clone()
+    x_2d[:, 1::2, :, :] = x_2d[:, 1::2, :, :].flip(2)
+    return x_2d
+
+
 def scan_images(x):
     """
-    SS2D Scan: 4 directions (Original, Flip H, Flip V, Flip HV)
+    SS2D Snake Scan: 4 directions with S-shaped traversal.
+    Each direction uses snake (zigzag) pattern for better spatial locality.
+    Ref: LC-Mamba (CVPR 2025), MaIR (2025) — reduces pixel discontinuity
+    
     Input: (B, H, W, C)
     Output: (4*B, L, C) where L = H*W
     """
     B, H, W, C = x.shape
     
-    # 1. Original
-    x0 = x.flatten(1, 2) # (B, L, C)
+    # 1. Original snake (T→B, alternating L→R / R→L)
+    x0 = _snake_flatten(x)                    # (B, L, C)
     
-    # 2. Flip H
-    x1 = x.flip(2).flatten(1, 2)
+    # 2. Flip H then snake (T→B, alternating R→L / L→R)
+    x1 = _snake_flatten(x.flip(2))            # (B, L, C)
     
-    # 3. Flip V
-    x2 = x.flip(1).flatten(1, 2)
+    # 3. Flip V then snake (B→T, alternating L→R / R→L)
+    x2 = _snake_flatten(x.flip(1))            # (B, L, C)
     
-    # 4. Flip HV (Rotate 180)
-    x3 = x.flip(1, 2).flatten(1, 2)
+    # 4. Flip HV then snake (B→T, alternating R→L / L→R)
+    x3 = _snake_flatten(x.flip(1, 2))         # (B, L, C)
     
     # Batch them together for Mamba efficiency
     x_scan = torch.cat([x0, x1, x2, x3], dim=0) # (4B, L, C)
     return x_scan
 
+
 def merge_images(x_scan, B, H, W):
     """
-    SS2D Merge: Reverse scanning and sum/average
+    SS2D Snake Merge: Reverse snake scanning and sum.
     Input: (4*B, L, C)
     Output: (B, H, W, C)
     """
@@ -129,11 +161,11 @@ def merge_images(x_scan, B, H, W):
     # Split back to 4 branches
     x0, x1, x2, x3 = x_scan.chunk(4, dim=0) # Each (B, L, C)
     
-    # Reshape and un-flip
-    x0 = x0.view(B, H, W, C)
-    x1 = x1.view(B, H, W, C).flip(2)
-    x2 = x2.view(B, H, W, C).flip(1)
-    x3 = x3.view(B, H, W, C).flip(1, 2)
+    # Reverse snake + un-flip
+    x0 = _snake_unflatten(x0, H, W)
+    x1 = _snake_unflatten(x1, H, W).flip(2)
+    x2 = _snake_unflatten(x2, H, W).flip(1)
+    x3 = _snake_unflatten(x3, H, W).flip(1, 2)
     
     return x0 + x1 + x2 + x3
 
