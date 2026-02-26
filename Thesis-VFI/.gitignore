@@ -11,6 +11,13 @@ log/
 
 # Jupyter
 .ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Debug / utility scripts (not part of core project)
+check_environment.py
+rtx5090_fallback.py
+test_model_memory.py
+unit_test_train.py
 
 # IDE
 .vscode/
