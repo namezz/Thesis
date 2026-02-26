@@ -301,7 +301,7 @@ class FactorizedSSMBlock(nn.Module):
 
     def __init__(self, d_model, d_state=64, d_conv=4, expand=2,
                  num_scan_dirs=4, stripe_width=4, shift=False,
-                 use_checkpointing=True):
+                 use_checkpointing=True, headdim=64):
         super().__init__()
         self.d_model = d_model
         self.use_checkpointing = use_checkpointing
@@ -309,7 +309,7 @@ class FactorizedSSMBlock(nn.Module):
         # Shared spatial Mamba2 (weight-tied across frames AND scan directions)
         self.spatial_mamba = Mamba2(
             d_model=d_model, d_state=d_state,
-            d_conv=d_conv, expand=expand
+            d_conv=d_conv, expand=expand, headdim=headdim
         )
 
         # NSS scanner
@@ -411,6 +411,7 @@ class LGSBlockV3(nn.Module):
                  mlp_ratio=4., drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm,
                  mamba_d_state=64, mamba_d_conv=4, mamba_expand=2,
+                 mamba_headdim=64,
                  num_scan_dirs=4, stripe_width=4,
                  backbone_mode='hybrid',
                  use_ecab=True, use_checkpointing=True):
@@ -438,6 +439,7 @@ class LGSBlockV3(nn.Module):
                 stripe_width=stripe_width,
                 shift=nss_shift,
                 use_checkpointing=use_checkpointing,
+                headdim=mamba_headdim,
             )
         else:
             self.factorized_ssm = None
@@ -601,7 +603,8 @@ class BasicLayerV3(nn.Module):
                  norm_layer=nn.LayerNorm,
                  num_scan_dirs=4, stripe_width=4,
                  backbone_mode='hybrid',
-                 use_ecab=True, use_checkpointing=True):
+                 use_ecab=True, use_checkpointing=True,
+                 mamba_headdim=64):
         super().__init__()
         self.blocks = nn.ModuleList([
             LGSBlockV3(
@@ -618,6 +621,7 @@ class BasicLayerV3(nn.Module):
                 backbone_mode=backbone_mode,
                 use_ecab=use_ecab,
                 use_checkpointing=use_checkpointing,
+                mamba_headdim=mamba_headdim,
             )
             for i in range(depth)
         ])
@@ -661,7 +665,8 @@ class HybridBackboneV3(nn.Module):
                  mlp_ratios=[4, 4, 4], drop_rate=0., drop_path_rate=0.1,
                  num_scan_dirs=4, stripe_width=4,
                  backbone_mode='hybrid',
-                 use_ecab=True, use_checkpointing=True):
+                 use_ecab=True, use_checkpointing=True,
+                 mamba_headdim=64):
         super().__init__()
         self.num_layers = len(depths)
         self.embed_dims = embed_dims
@@ -695,6 +700,7 @@ class HybridBackboneV3(nn.Module):
                 backbone_mode=backbone_mode,
                 use_ecab=use_ecab,
                 use_checkpointing=use_checkpointing,
+                mamba_headdim=mamba_headdim,
             )
             self.layers.append(layer)
 
@@ -836,4 +842,5 @@ def build_backbone_v3(cfg):
         backbone_mode=cfg.get('backbone_mode', 'hybrid'),
         use_ecab=cfg.get('use_ecab', True),
         use_checkpointing=cfg.get('use_checkpointing', True),
+        mamba_headdim=cfg.get('mamba_headdim', 64),
     )

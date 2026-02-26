@@ -61,6 +61,31 @@ PHASE1_V3_CONFIG = {
     'USE_X4K_TRAINING': False,
 }
 
+# Phase 1 V3-HP: High-Performance (F=48, d=[3,3,3], ~5.38M params)
+PHASE1_V3_HP_CONFIG = {
+    'LOGNAME': 'phase1_nss_v3_hp',
+    'PHASE': 1,
+    'MODEL_ARCH': {**init_model_config(F=48, W=8, depth=[3, 3, 3], backbone_mode='hybrid'),
+                   'num_heads': [3, 6, 12],
+                   'use_flow': False, 'use_backbone_v3': True,
+                   'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True,
+                   'mamba_headdim': 32},
+    'USE_FLOW': False,
+    'USE_X4K_TRAINING': False,
+}
+
+# Phase 1 V3-Ultra: Maximum capacity (F=64, d=[4,4,4], ~10.37M params)
+PHASE1_V3_ULTRA_CONFIG = {
+    'LOGNAME': 'phase1_nss_v3_ultra',
+    'PHASE': 1,
+    'MODEL_ARCH': {**init_model_config(F=64, W=8, depth=[4, 4, 4], backbone_mode='hybrid'),
+                   'num_heads': [4, 8, 16],
+                   'use_flow': False, 'use_backbone_v3': True,
+                   'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True},
+    'USE_FLOW': False,
+    'USE_X4K_TRAINING': False,
+}
+
 PHASE2_CONFIG = {
     'LOGNAME': 'phase2_flow',
     'PHASE': 2,
@@ -94,6 +119,31 @@ PHASE2_V3_CONFIG = {
     'LOGNAME': 'phase2_nss_flow',
     'PHASE': 2,
     'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'),
+                   'use_flow': True, 'use_backbone_v3': True,
+                   'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True},
+    'USE_FLOW': True,
+    'USE_X4K_TRAINING': False,
+}
+
+# Phase 2 V3-HP: NSS HP backbone + flow
+PHASE2_V3_HP_CONFIG = {
+    'LOGNAME': 'phase2_nss_flow_hp',
+    'PHASE': 2,
+    'MODEL_ARCH': {**init_model_config(F=48, W=8, depth=[3, 3, 3], backbone_mode='hybrid'),
+                   'num_heads': [3, 6, 12],
+                   'use_flow': True, 'use_backbone_v3': True,
+                   'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True,
+                   'mamba_headdim': 32},
+    'USE_FLOW': True,
+    'USE_X4K_TRAINING': False,
+}
+
+# Phase 2 V3-Ultra: NSS Ultra backbone + flow
+PHASE2_V3_ULTRA_CONFIG = {
+    'LOGNAME': 'phase2_nss_flow_ultra',
+    'PHASE': 2,
+    'MODEL_ARCH': {**init_model_config(F=64, W=8, depth=[4, 4, 4], backbone_mode='hybrid'),
+                   'num_heads': [4, 8, 16],
                    'use_flow': True, 'use_backbone_v3': True,
                    'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True},
     'USE_FLOW': True,
