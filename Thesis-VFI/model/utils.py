@@ -1,8 +1,28 @@
+"""
+utils.py — Shared modules for VFI backbone stages
+====================================================
+Active modules (used by backbone_v1/v2/v3):
+  - window_partition / window_reverse   — GatedWindowAttention
+  - Mlp                                 — Attention block FFN
+  - ECAB                                — channel attention (ECA-Net)
+  - CrossGatingFusion                   — Mamba2 + Attention branch fusion
+  - matvlm_init_mamba2                  — weight transfer init
+
+V1-only modules (kept for backward compat):
+  - scan_images / merge_images          — 4-dir snake SS2D scan
+  - ManifoldResConnection               — mHC ablation candidate
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 from timm.models.layers import to_2tuple, trunc_normal_
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Window Utilities (all backbones)
+# ════════════════════════════════════════════════════════════════════════════
 
 def window_partition(x, window_size):
     """
@@ -33,6 +53,7 @@ def window_reverse(windows, window_size, H, W):
     return x
 
 class Mlp(nn.Module):
+    """Feed-forward network for attention blocks."""
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
         out_features = out_features or in_features
@@ -57,6 +78,10 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+# ════════════════════════════════════════════════════════════════════════════
+# Channel Attention (all backbones)
+# ════════════════════════════════════════════════════════════════════════════
+
 class ECAB(nn.Module):
     """
     Efficient Channel Attention Block (ECA-Net, CVPR 2020)
@@ -80,6 +105,9 @@ class ECAB(nn.Module):
         if x.dim() == 3: # (B, L, C)
             is_sequence = True
             B, L, C = x.shape
+            # Safety: L should be window_size² or H*W for a single frame.
+            # If L = 2*H*W (interleaved two-frame sequence), this pooling
+            # would incorrectly mix frames. Caller must ensure single-frame input.
             y = x.mean(1).view(B, 1, C) # (B, 1, C)
         else:
             y = self.avg_pool(x) # (B, C, 1, 1)
@@ -93,6 +121,11 @@ class ECAB(nn.Module):
             return x * y.transpose(1, 2) # (B, L, C) * (B, 1, C)
         else:
             return x * y.unsqueeze(-1) # (B, C, H, W) * (B, C, 1, 1)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Snake SS2D Scan (backbone V1 only — V3 uses NSScan internally)
+# ════════════════════════════════════════════════════════════════════════════
 
 def _snake_flatten(x):
     """
@@ -170,98 +203,10 @@ def merge_images(x_scan, B, H, W):
     return x0 + x1 + x2 + x3
 
 
-def interleaved_scan(x):
-    """
-    VFIMamba-style Interleaved SS2D Scan for cross-frame temporal interaction.
-    Ref: VFIMamba (NeurIPS 2024, Zhang et al.)
 
-    Input: x of shape (2B, H, W, C) — first B samples are frame0 features,
-           last B samples are frame1 features (batch-concatenated).
-    Output: (4B, L, C) where L = 2*H*W (interleaved tokens from both frames)
-
-    Key insight: Interleaving tokens from two frames into one sequence lets the
-    SSM's recurrent state carry information across frames, enabling cross-frame
-    temporal modeling within a single Mamba pass.
-
-    4 scan directions:
-      1. H→W order (interleaved)
-      2. W→H order (transposed, interleaved)
-      3. Reverse of direction 1
-      4. Reverse of direction 2
-    """
-    twoB, H, W, C = x.shape
-    B = twoB // 2
-    L = 2 * H * W
-    
-    # Convert to (2B, C, H, W) for spatial operations
-    x_perm = x.permute(0, 3, 1, 2).contiguous()  # (2B, C, H, W)
-
-    def _merge_frames(feat):
-        """Interleave frame0 and frame1 tokens: (2B, C, H, W) -> (B, C, 2*H*W)"""
-        # feat: (2B, C, H, W)
-        feat_flat = feat.reshape(twoB, C, H * W).transpose(1, 2)  # (2B, H*W, C)
-        # Interleave: concat frame0[i] and frame1[i] along sequence dim
-        merged = torch.cat([feat_flat[:B], feat_flat[B:]], dim=-1)  # (B, H*W, 2C)
-        merged = merged.reshape(B, L, C)  # (B, 2*H*W, C)
-        return merged.transpose(1, 2).contiguous()  # (B, C, L)
-
-    # Direction 1: H→W scan
-    d1 = _merge_frames(x_perm)  # (B, C, L)
-    # Direction 2: W→H scan (transpose spatial dims)
-    x_trans = x_perm.transpose(2, 3).contiguous()  # (2B, C, W, H)
-    d2 = _merge_frames(x_trans)  # (B, C, L)
-
-    # Stack directions 1 & 2, then add their reverses as directions 3 & 4
-    x_hwwh = torch.stack([d1, d2], dim=1)  # (B, 2, C, L)
-    xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1)  # (B, 4, C, L)
-
-    # Reshape to (4B, L, C) for Mamba processing
-    xs = xs.reshape(4 * B, C, L).transpose(1, 2).contiguous()  # (4B, L, C)
-    return xs
-
-
-def interleaved_merge(x_scan, B, H, W):
-    """
-    VFIMamba-style Interleaved SS2D Merge: reverse the interleaved scanning.
-    Input: (4B, L, C) where L = 2*H*W
-    Output: (2B, H, W, C) — first B are frame0, last B are frame1
-
-    Reverses the 4 scan directions and de-interleaves the merged sequences
-    back to per-frame feature maps.
-    """
-    L = 2 * H * W
-    C = x_scan.shape[-1]
-
-    # (4B, L, C) -> (B, 4, C, L)
-    out = x_scan.transpose(1, 2).contiguous().reshape(B, 4, C, L)
-    
-    # Reverse directions 3 & 4
-    out[:, 2] = torch.flip(out[:, 2], dims=[-1])
-    out[:, 3] = torch.flip(out[:, 3], dims=[-1])
-
-    def _unmerge_frames(merged, h, w):
-        """De-interleave: (B, C, 2*h*w) -> (2B, C, h, w)"""
-        # merged: (B, C, L) where L = 2*h*w
-        merged_seq = merged.transpose(1, 2).contiguous()  # (B, L, C)
-        merged_seq = merged_seq.reshape(B, h * w, 2, C)  # (B, h*w, 2, C)
-        f0 = merged_seq[:, :, 0, :]  # (B, h*w, C)
-        f1 = merged_seq[:, :, 1, :]  # (B, h*w, C)
-        f0 = f0.transpose(1, 2).reshape(B, C, h, w)
-        f1 = f1.transpose(1, 2).reshape(B, C, h, w)
-        return torch.cat([f0, f1], dim=0)  # (2B, C, h, w)
-
-    # Direction 1 (H→W) + Direction 3 (reverse of 1): sum and de-interleave
-    y_hw = _unmerge_frames(out[:, 0] + out[:, 2], H, W)  # (2B, C, H, W)
-    
-    # Direction 2 (W→H) + Direction 4 (reverse of 2): sum, transpose back, de-interleave
-    y_wh_merged = out[:, 1] + out[:, 3]  # (B, C, L)
-    y_wh = _unmerge_frames(y_wh_merged, W, H)  # (2B, C, W, H) — note: W, H swapped
-    y_wh = y_wh.transpose(2, 3).contiguous()  # (2B, C, H, W) — transpose back
-
-    # Sum all directions
-    y = y_hw + y_wh  # (2B, C, H, W)
-    return y.permute(0, 2, 3, 1).contiguous()  # (2B, H, W, C)
-
+# ════════════════════════════════════════════════════════════════════════════
+# Manifold Res-Connection (backbone V1 ablation — not used by V3)
+# ════════════════════════════════════════════════════════════════════════════
 
 def sinkhorn_log(logits, num_iters=10, tau=0.05):
     """
@@ -372,6 +317,10 @@ class ManifoldResConnection(nn.Module):
         return add_residual_fn(branch_out)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Cross-Gating Fusion (all backbones — hybrid Mamba+Attention branch fusion)
+# ════════════════════════════════════════════════════════════════════════════
+
 class CrossGatingFusion(nn.Module):
     """
     Bi-directional Cross-Gating Fusion for Mamba2 + Attention branch outputs.
@@ -419,6 +368,10 @@ class CrossGatingFusion(nn.Module):
         f_fused = torch.cat([f_mamba_gated, f_attn_gated], dim=1)
         return self.out_proj(f_fused)
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# MaTVLM Weight Transfer Init (all backbones — Attention→Mamba2 init)
+# ════════════════════════════════════════════════════════════════════════════
 
 def matvlm_init_mamba2(mamba_layer, attn_layer):
     """
