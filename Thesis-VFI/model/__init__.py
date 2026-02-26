@@ -2,7 +2,7 @@ from .backbone import build_backbone
 from .backbone_v2 import build_backbone_v2
 from .backbone_v3 import build_backbone_v3
 from .flow import build_flow_estimator
-from .refine import RefineNet
+from .refine import build_refine_net
 from .warplayer import warp
 import torch.nn as nn
 import torch
@@ -70,9 +70,12 @@ class ThesisModel(nn.Module):
             self.context0 = ContextNet(c=c)
             self.context1 = ContextNet(c=c)
         
-        # Refine Head
-        c = cfg['embed_dims'][0]
-        self.refine = RefineNet(c=c, use_context=self.use_flow)
+        # Refine Head — new interface: takes warped_blend, outputs (residual, pred_list)
+        self.refine = build_refine_net(
+            embed_dims=cfg['embed_dims'],
+            use_context=self.use_flow,
+            multiscale_pred=True,
+        )
         
     def forward(self, x, timestep=0.5):
         img0, img1 = x[:, :3], x[:, 3:6]
@@ -87,36 +90,35 @@ class ThesisModel(nn.Module):
                 feats, img0, img1, timestep=timestep
             )
 
-            # Warp images for blending
+            # Warp images and blend using flow mask
+            mask = torch.sigmoid(flow_mask)
             warped_img0 = warp(img0, flow_01)
             warped_img1 = warp(img1, flow_10)
-            
+            warped_blend = mask * warped_img0 + (1 - mask) * warped_img1
+
             # Extract and warp context features (RIFE/VFIMamba style)
             ctx0 = self.context0(img0, flow_01)
             ctx1 = self.context1(img1, flow_10)
-            
-            # RefineNet receives backbone features + warped context
-            res, refine_mask = self.refine(feats, ctx0=ctx0, ctx1=ctx1)
-            
-            # Combine flow mask and refine mask
-            mask = torch.sigmoid(flow_mask + refine_mask)
-            merged = warped_img0 * mask + warped_img1 * (1 - mask)
-            pred = merged + res
-            pred = torch.clamp(pred, 0, 1)
 
-            # Pack flow info for loss: (B, 4, H, W) combined + separate refs
+            # RefineNet: residual correction on warped blend + multi-scale preds
+            residual, pred_list = self.refine(
+                feats, warped_blend, ctx0=ctx0, ctx1=ctx1
+            )
+
+            # Pack flow info for loss: (B, 4, H, W) combined
             flow_combined = torch.cat([flow_01, flow_10], dim=1)
-            return pred, flow_combined
+            return pred_list, flow_combined
         else:
-            # Phase 1: Backbone only (Direct Regression)
+            # Phase 1: Backbone only (no flow)
             feats = self.backbone(img0, img1)
-            res, mask = self.refine(feats)
-            
-            # Learned mask blending of original frames + residual refinement
-            merged = img0 * mask + img1 * (1 - mask)
-            pred = merged + res
-            pred = torch.clamp(pred, 0, 1)
-            return pred, None
+
+            # Simple temporal average as warped blend (no flow available)
+            warped_blend = 0.5 * (img0 + img1)
+
+            # RefineNet learns residual correction from this baseline
+            residual, pred_list = self.refine(feats, warped_blend)
+
+            return pred_list, None
 
     def inference(self, img0, img1, TTA=False, scale=1.0, timestep=0.5, fast_TTA=False):
         """
@@ -147,7 +149,7 @@ class ThesisModel(nn.Module):
         def _infer(i0, i1):
             x = torch.cat((i0, i1), 1)
             pred, _ = self.forward(x, timestep)
-            return pred
+            return pred[0] if isinstance(pred, (list, tuple)) else pred
 
         if TTA:
             if fast_TTA:

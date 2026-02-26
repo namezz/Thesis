@@ -168,6 +168,8 @@ class Model:
             amp_dtype = torch.bfloat16 if self.use_bf16 else torch.float16
             with torch.amp.autocast('cuda', dtype=amp_dtype):
                 pred, flow = self.net(x)
+                # pred is now a list of multi-scale predictions [finest, ..., coarsest]
+                # CompositeLoss handles list pred when multiscale_weights is set
                 # Split combined flow into forward/backward for occlusion-aware loss
                 flow_bwd = None
                 if flow is not None and flow.shape[1] >= 4:
@@ -191,13 +193,16 @@ class Model:
                     self.scaler.update()
                 else:
                     self.optimG.step()
-            return pred, loss_dict
+            # Return finest prediction for visualization/metrics
+            pred_out = pred[0] if isinstance(pred, (list, tuple)) else pred
+            return pred_out, loss_dict
         else: 
             self.eval()
             with torch.no_grad():
                 x = torch.cat(imgs, dim=1) if isinstance(imgs, list) else imgs
                 pred, _ = self.net(x)
-                return pred, {}
+                pred_out = pred[0] if isinstance(pred, (list, tuple)) else pred
+                return pred_out, {}
 
     def accum_step(self):
         """Perform optimizer step after gradient accumulation."""
