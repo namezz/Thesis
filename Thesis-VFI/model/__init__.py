@@ -64,7 +64,7 @@ class ThesisModel(nn.Module):
         
         self.use_flow = cfg.get('use_flow', False)
         if self.use_flow:
-            self.flow_estimator = build_flow_estimator()
+            self.flow_estimator = build_flow_estimator(cfg=cfg)
             c = cfg['embed_dims'][0]
             # Context nets extract per-frame features to warp with flow
             self.context0 = ContextNet(c=c)
@@ -79,22 +79,21 @@ class ThesisModel(nn.Module):
         
         if self.use_flow:
             # Phase 2: Flow-guided feature warping
-            flow, flow_mask = self.flow_estimator(img0, img1, timestep=timestep)
-            
-            # Flow is bidirectional: flow[:, :2] = img0→t, flow[:, 2:4] = img1→t
-            f0 = flow[:, :2]
-            f1 = flow[:, 2:4]
-            
-            # Warp images for blending
-            warped_img0 = warp(img0, f0)
-            warped_img1 = warp(img1, f1)
-            
-            # Extract and warp context features (RIFE/VFIMamba style)
-            ctx0 = self.context0(img0, f0)
-            ctx1 = self.context1(img1, f1)
-            
             # Backbone processes ORIGINAL frames (cross-frame attention on unwarped content)
             feats = self.backbone(img0, img1)
+
+            # Flow estimator uses backbone features for feature-guided estimation
+            flow_01, flow_10, flow_mask, flow_list = self.flow_estimator(
+                feats, img0, img1, timestep=timestep
+            )
+
+            # Warp images for blending
+            warped_img0 = warp(img0, flow_01)
+            warped_img1 = warp(img1, flow_10)
+            
+            # Extract and warp context features (RIFE/VFIMamba style)
+            ctx0 = self.context0(img0, flow_01)
+            ctx1 = self.context1(img1, flow_10)
             
             # RefineNet receives backbone features + warped context
             res, refine_mask = self.refine(feats, ctx0=ctx0, ctx1=ctx1)
@@ -104,7 +103,10 @@ class ThesisModel(nn.Module):
             merged = warped_img0 * mask + warped_img1 * (1 - mask)
             pred = merged + res
             pred = torch.clamp(pred, 0, 1)
-            return pred, flow
+
+            # Pack flow info for loss: (B, 4, H, W) combined + separate refs
+            flow_combined = torch.cat([flow_01, flow_10], dim=1)
+            return pred, flow_combined
         else:
             # Phase 1: Backbone only (Direct Regression)
             feats = self.backbone(img0, img1)

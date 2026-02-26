@@ -168,7 +168,13 @@ class Model:
             amp_dtype = torch.bfloat16 if self.use_bf16 else torch.float16
             with torch.amp.autocast('cuda', dtype=amp_dtype):
                 pred, flow = self.net(x)
-                loss_total, loss_dict = self.loss_fn(pred, gt, flow=flow, img0=img0)
+                # Split combined flow into forward/backward for occlusion-aware loss
+                flow_bwd = None
+                if flow is not None and flow.shape[1] >= 4:
+                    flow_bwd = flow[:, 2:4]
+                loss_total, loss_dict = self.loss_fn(
+                    pred, gt, flow=flow, flow_backward=flow_bwd, img0=img0
+                )
             
             if not accumulate:
                 self.optimG.zero_grad()
