@@ -92,6 +92,7 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
                 print(f"Epoch {epoch}: Backbone unfrozen")
         
         sampler.set_epoch(epoch)
+        torch.cuda.empty_cache()
         
         # Update loss function with current epoch for dynamic scheduling
         model.loss_fn.current_epoch = epoch
@@ -176,6 +177,8 @@ def evaluate(model, val_data, nr_eval, local_rank, writer_val=None, best_psnr_ho
         for j in range(gt.shape[0]):
             psnr_list.append(-10 * math.log10(((gt[j] - pred[j]) * (gt[j] - pred[j])).mean().cpu().item()))
             ssim_list.append(ssim_matlab(gt[j:j+1], pred[j:j+1]).cpu().item())
+        # Explicitly delete loop tensors
+        del imgs, gt, pred
    
     avg_psnr = np.array(psnr_list).mean()
     avg_ssim = np.array(ssim_list).mean()
@@ -189,6 +192,9 @@ def evaluate(model, val_data, nr_eval, local_rank, writer_val=None, best_psnr_ho
             best_psnr_holder['val'] = avg_psnr
             model.save_model(rank=0, suffix='_best')
             print(f"  ★ New best PSNR: {avg_psnr:.4f}, saved as ckpt/{model.name}_best.pkl")
+    
+    # Cleanup after evaluation
+    torch.cuda.empty_cache()
         
 if __name__ == "__main__":    
     parser = argparse.ArgumentParser()
