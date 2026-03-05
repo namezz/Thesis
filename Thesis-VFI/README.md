@@ -100,28 +100,46 @@ Thesis-VFI/
 - **核心依賴**: `mamba-ssm`, `causal-conv1d` (須針對 sm_120 編譯)
 
 ### 安裝步驟
+
 ```bash
-# 1. 建立環境
-conda create -n thesis python=3.11 && conda activate thesis
-# 2. 安裝 PyTorch
+# 1. 建立 conda 環境
+conda create -n thesis python=3.11
+conda activate thesis
+
+# 2. 安裝 PyTorch（CUDA 12.8）
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
 # 3. 安裝建置工具
-pip install ninja && conda install -c nvidia cuda-toolkit=12.8
-# 4. 編譯核心組件
-git clone https://github.com/yacinemassena/causal-conv1d-sm120.git && cd causal-conv1d-sm120 && pip install . && cd ..
-git clone https://github.com/state-spaces/mamba.git && cd mamba && pip install . && cd ..
-# 5. 安裝其餘依賴
+pip install ninja
+conda install -c nvidia cuda-toolkit=12.8
+
+# 4. 編譯 causal-conv1d（sm_120 fork）
+git clone https://github.com/yacinemassena/causal-conv1d-sm120.git
+cd causal-conv1d-sm120 && pip install . && cd ..
+
+# 5. 編譯 mamba-ssm
+git clone https://github.com/state-spaces/mamba.git
+cd mamba && pip install . && cd ..
+
+# 6. 安裝其餘依賴（必須在 mamba-ssm 之後，避免 numpy/torch 版本被覆蓋）
 pip install -r requirements.txt
+
+# 7. 驗證
+python -c "from mamba_ssm import Mamba2; print('Mamba2 OK')"
+python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')"
 ```
+
+> **注意**：`mamba-ssm` 與 `causal-conv1d` 需從原始碼編譯，不在 `requirements.txt` 中。
+> 若遇到 `libstdc++` 版本不符，請參考 [ssm_fix.md](ssm_fix.md)。
 
 ---
 
 ## 訓練指令 (Quick Start)
 
 ### 通用參數
-- `--phase`: 1, 2, or 3
-- `--variant`: base, hp, or ultra
-- `--grad_accum`: 梯度累積 (Blackwell 建議 2)
+- `--phase`: 訓練階段 (1, 2, or 3)
+- `--variant`: 模型變體 (base, hp, or ultra)
+- `--grad_accum`: 梯度累積步數 (Blackwell 建議 2)
 
 ### 執行範例 (RTX 5000 48GB Optimized)
 ```bash
@@ -151,8 +169,27 @@ torchrun --nproc_per_node=1 train.py \
 ---
 
 ## Changelog
-### v11.0 (Current)
-- **Architecture**: 實作 **Feature Shunting (Channel Split)**，分支參數量減半。
-- **Fusion**: 升級 **Spatial-aware CrossGating** (整合 3x3 DW Conv)。
-- **Bugfix**: 修復 Hybrid 模式下漏掉 ECAB 呼叫的問題。
-- **Optimization**: 針對 Blackwell 48GB 加入 `expandable_segments` 與 Step-level 變數清理。
+
+### v10.0 (Current)
+- **loss.py** 全面重構：6 項修正 + 2 項新增（FFT Loss、Occlusion-aware Flow Smoothness）
+- **flow.py** 全面重構：Feature-guided coarse-to-fine 光流估計器（取代 RIFE IFNet）
+- **refine.py** 全面重構：PixelShuffle + Channel Attention + residual-on-warped + multi-scale output
+- **warplayer.py** 重構：BackWarp nn.Module + instance-level grid cache
+- **utils.py** 清理：移除 dead code（interleaved scan），加入 section headers
+- **\_\_init\_\_.py** 更新：整合新 flow/refine 介面，支援 pred_list multi-scale output
+- **Trainer.py** 更新：支援 multi-scale pred、occlusion-aware loss、discriminative LR
+
+### v9.2
+- Checkpoint resume with train_state（epoch, step, best_psnr）
+- Dataset: 過濾空行防止路徑錯誤
+- CLI: 新增 `--num_workers`, `--grad_accum`, `--eval_interval`
+
+### v9.1
+- Gradient clipping（max_norm=1.0）、optimizer state resume
+- `crop_size` 參數、X4K resize 安全檢查
+- VGG perceptual loss 使用 `register_buffer`
+
+### v9.0
+- Phase-aware composite loss（LapLoss + Ternary + VGG + FlowSmoothness）
+- NSS Scan backbone V3、CrossGating Fusion
+- MaTVLM-style attention → Mamba2 初始化
