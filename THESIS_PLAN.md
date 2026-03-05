@@ -26,11 +26,13 @@ cd Thesis-VFI
 
 # Phase 1 主實驗 (Ultra Backbone)
 # Effective Batch = 16 (8x2), VRAM ~44GB
-nohup torchrun --nproc_per_node=1 train.py \
+nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
+    torchrun --nproc_per_node=1 train.py \
     --phase 1 --variant ultra \
     --batch_size 8 --grad_accum 2 \
     --data_path /josh/dataset/vimeo90k/vimeo_triplet \
-    --exp_name phase1_ultra > train_p1.log 2>&1 &
+    --num_workers 12 \
+    --exp_name phase1_ultra_final > train_p1.log 2>&1 &
 ```
 
 ### 第二階段：光流導引增強 (Phase 2: Motion Guidance)

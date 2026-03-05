@@ -20,6 +20,7 @@
 
 ### 1. 訓練與執行 (Training & Execution)
 - **Distributed Training**: 一律使用 `torchrun`。
+- **Environment Variable**: 針對 Blackwell 硬體，建議設置 `PYTORCH_ALLOC_CONF=expandable_segments:True` 以降低顯存碎片化。
 - **Command Entry**: 進入點為 `train.py`。
 - **Variant Selection**: 使用 `--variant {base, hp, ultra}` 控制模型大小。
   - `base`: F=32, depths=[2,2,2]
@@ -31,11 +32,13 @@
 
 ### Phase 1: Backbone 預訓練 (Ultra 48GB Optimized)
 ```bash
-torchrun --nproc_per_node=1 train.py \
+nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
+    torchrun --nproc_per_node=1 train.py \
     --phase 1 --variant ultra \
     --batch_size 8 --grad_accum 2 \
     --data_path /josh/dataset/vimeo90k/vimeo_triplet \
-    --exp_name phase1_ultra_unified
+    --num_workers 12 \
+    --exp_name phase1_ultra_final > train_p1.log 2>&1 &
 ```
 
 ### Phase 2: 光流引導

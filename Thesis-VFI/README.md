@@ -116,11 +116,13 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
 
 **Phase 1：Backbone 預訓練 (Ultra)**
 ```bash
-torchrun --nproc_per_node=1 train.py \
+nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
+    torchrun --nproc_per_node=1 train.py \
     --phase 1 --variant ultra \
     --batch_size 8 --grad_accum 2 \
     --data_path /josh/dataset/vimeo90k/vimeo_triplet \
-    --exp_name phase1_ultra
+    --num_workers 12 \
+    --exp_name phase1_ultra_final > train_p1.log 2>&1 &
 ```
 
 **Phase 2：光流引導**

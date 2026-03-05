@@ -129,6 +129,10 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
             
             if local_rank == 0:
                 pbar.set_postfix({'loss': f'{loss_dict.get("loss_total", 0):.4e}', 'lr': f'{learning_rate:.2e}'})
+            
+            # Explicitly delete large tensors to free memory for the next step
+            del imgs, gt
+            
             step += 1
             
         nr_eval += 1
