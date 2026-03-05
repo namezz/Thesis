@@ -170,7 +170,13 @@ torchrun --nproc_per_node=1 train.py \
 
 ## Changelog
 
-### v10.0 (Current)
+### v11.0 (Current)
+- **Architecture**: 實作 **Feature Shunting (Channel Split)**，分支參數量減半，效能大幅提升。
+- **Fusion**: 升級 **Spatial-aware CrossGating** (整合 3x3 DW Conv)，增強邊界感知能力。
+- **Bugfix**: 修復 Hybrid 模式下漏掉 ECAB 呼叫的問題，確保特徵校準生效。
+- **Optimization**: 針對 Blackwell 48GB 加入 `expandable_segments` 與 Step-level 變數清理，徹底解決 OOM。
+
+### v10.0
 - **loss.py** 全面重構：6 項修正 + 2 項新增（FFT Loss、Occlusion-aware Flow Smoothness）
 - **flow.py** 全面重構：Feature-guided coarse-to-fine 光流估計器（取代 RIFE IFNet）
 - **refine.py** 全面重構：PixelShuffle + Channel Attention + residual-on-warped + multi-scale output
