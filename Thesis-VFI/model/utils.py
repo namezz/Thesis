@@ -324,28 +324,21 @@ class ManifoldResConnection(nn.Module):
 class CrossGatingFusion(nn.Module):
     """
     Bi-directional Cross-Gating Fusion for Mamba2 + Attention branch outputs.
-    
-    Uses Conv2d bottleneck gates for spatial-aware cross-filtering:
-    - Attention's sharp edges filter Mamba's global features (suppress over-smoothing)
-    - Mamba's global context suppresses Attention's local noise
-    
-    Math:
-        F_out = W_proj[ (F_M ⊙ σ(H_attn(F_A))) ∥ (F_A ⊙ σ(H_mamba(F_M))) ]
-    
-    Gradient advantage: ∂L/∂F_M contains F_A-weighted dynamics, forcing Mamba
-    to learn complementary features to Attention (true synergy).
+    Upgraded with 3x3 Depthwise Convolutions for spatial-aware gating.
     """
     def __init__(self, d_model):
         super().__init__()
         self.d_model = d_model
-        # Gate: Mamba features → gate for Attention branch
+        # Gate: Mamba features -> gate for Attention branch (Spatial-aware)
         self.gate_mamba_to_attn = nn.Sequential(
+            nn.Conv2d(d_model, d_model, kernel_size=3, padding=1, groups=d_model),
             nn.Conv2d(d_model, d_model // 2, kernel_size=1),
             nn.GELU(),
             nn.Conv2d(d_model // 2, d_model, kernel_size=1)
         )
-        # Gate: Attention features → gate for Mamba branch
+        # Gate: Attention features -> gate for Mamba branch (Spatial-aware)
         self.gate_attn_to_mamba = nn.Sequential(
+            nn.Conv2d(d_model, d_model, kernel_size=3, padding=1, groups=d_model),
             nn.Conv2d(d_model, d_model // 2, kernel_size=1),
             nn.GELU(),
             nn.Conv2d(d_model // 2, d_model, kernel_size=1)

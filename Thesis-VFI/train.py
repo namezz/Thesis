@@ -13,7 +13,7 @@ from dataset import VimeoDataset, X4KDataset, MixedDataset
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data.distributed import DistributedSampler
-from config import MODEL_CONFIG, PHASE1_CONFIG, PHASE2_CONFIG, PHASE2_CG_CONFIG, PHASE3_CONFIG, ABLATION_CONFIGS, init_model_config, PHASE1_V2_CONFIG, PHASE2_V2_CONFIG, PHASE1_V3_CONFIG, PHASE2_V3_CONFIG, PHASE1_V3_HP_CONFIG, PHASE2_V3_HP_CONFIG, PHASE1_V3_ULTRA_CONFIG, PHASE2_V3_ULTRA_CONFIG
+import config as project_config
 from benchmark.utils.pytorch_msssim import ssim_matlab
 
 device = torch.device("cuda")
@@ -29,9 +29,10 @@ def get_learning_rate(step, step_per_epoch, total_epochs=300, base_lr=2e-4, min_
 from tqdm import tqdm
 
 def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(2, 1), freeze_epochs=0, total_epochs=300, curriculum=False, curriculum_T=50, crop_size=256, lr=2e-4, num_workers=8, grad_accum=1, eval_interval=10):
+    logname = project_config.MODEL_CONFIG["LOGNAME"]
     if local_rank == 0:
-        writer = SummaryWriter(f'log/train_{MODEL_CONFIG["LOGNAME"]}')
-        writer_val = SummaryWriter(f'log/validate_{MODEL_CONFIG["LOGNAME"]}')
+        writer = SummaryWriter(f'log/train_{logname}')
+        writer_val = SummaryWriter(f'log/validate_{logname}')
     else:
         writer = None
         writer_val = None
@@ -41,7 +42,7 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
     start_epoch = 0
     
     # Resume training state from checkpoint if available
-    optim_path = f'ckpt/{MODEL_CONFIG["LOGNAME"]}_optim.pkl'
+    optim_path = f'ckpt/{logname}_optim.pkl'
     if os.path.exists(optim_path):
         optim_ckpt = torch.load(optim_path, map_location='cpu', weights_only=False)
         train_state = optim_ckpt.get('train_state', None)
@@ -58,19 +59,18 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
         model.freeze_backbone()
     
     vimeo_train = VimeoDataset('train', data_path)
-    vimeo_train.h = vimeo_train.w = crop_size  # Override default crop size
-    if MODEL_CONFIG.get('USE_X4K_TRAINING', False) and x4k_path:
-        if local_rank == 0: print(f"Phase 3: Enabling Mixed Training (Vimeo + X4K) with ratio {mixed_ratio}")
+    vimeo_train.h = vimeo_train.w = crop_size
+    if project_config.MODEL_CONFIG.get('USE_X4K_TRAINING', False) and x4k_path:
+        if local_rank == 0: print(f"Phase 3: Mixed Training enabled with ratio {mixed_ratio}")
         x4k_train = X4KDataset('train', x4k_path)
         dataset = MixedDataset(vimeo_train, x4k_train, ratio=mixed_ratio)
     else:
         dataset = vimeo_train
     
-    # Curriculum learning crop sizes
     if curriculum:
         curriculum_sizes = [256, 384, 512]
         if local_rank == 0:
-            print(f"Curriculum learning enabled: sizes={curriculum_sizes}, transition at epoch {curriculum_T}")
+            print(f"Curriculum learning enabled: sizes={curriculum_sizes}")
         
     sampler = DistributedSampler(dataset)
     train_data = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=True, drop_last=True, sampler=sampler)
@@ -80,269 +80,140 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
     val_data = DataLoader(dataset_val, batch_size=batch_size, pin_memory=True, num_workers=num_workers)
     
     if local_rank == 0:
-        print(f'Training with {MODEL_CONFIG["LOGNAME"]}...')
+        print(f'Training with {logname}...')
         if grad_accum > 1:
             print(f'Gradient accumulation: {grad_accum} steps, effective batch = {batch_size * grad_accum}')
+            
     time_stamp = time.time()
     for epoch in range(start_epoch, total_epochs):
-        # Unfreeze backbone after freeze_epochs
         if freeze_epochs > 0 and epoch == freeze_epochs:
             model.unfreeze_backbone()
-            if local_rank == 0:
-                print(f"Epoch {epoch}: Backbone unfrozen")
+            if local_rank == 0: print(f"Epoch {epoch}: Backbone unfrozen")
         
         sampler.set_epoch(epoch)
         torch.cuda.empty_cache()
-        
-        # Update loss function with current epoch for dynamic scheduling
         model.loss_fn.current_epoch = epoch
         
-        # Curriculum learning: update crop size and X4K mixing ratio
         if curriculum:
-            if epoch < curriculum_T:
-                crop_idx = 0  # 256
-            elif epoch < curriculum_T * 2:
-                crop_idx = 1  # 384
-            else:
-                crop_idx = 2  # 512
-            crop_idx = min(crop_idx, len(curriculum_sizes) - 1)
-            new_crop = curriculum_sizes[crop_idx]
-            # Update dataset crop sizes
-            if hasattr(dataset, 'h'):
-                dataset.h, dataset.w = new_crop, new_crop
-            elif hasattr(dataset, 'vimeo'):
+            if epoch < curriculum_T: crop_idx = 0
+            elif epoch < curriculum_T * 2: crop_idx = 1
+            else: crop_idx = 2
+            new_crop = curriculum_sizes[min(crop_idx, 2)]
+            if hasattr(dataset, 'vimeo'):
                 dataset.vimeo.h = dataset.vimeo.w = new_crop
-                if hasattr(dataset, 'x4k'):
-                    dataset.x4k.h = dataset.x4k.w = new_crop
-            if local_rank == 0 and (epoch == 0 or epoch == curriculum_T or epoch == curriculum_T * 2):
-                print(f"Curriculum: epoch {epoch}, crop_size={new_crop}")
+                if hasattr(dataset, 'x4k'): dataset.x4k.h = dataset.x4k.w = new_crop
+            else:
+                dataset.h = dataset.w = new_crop
             
-            # Sigmoid X4K mixing schedule: P(e) = P_max / (1 + exp(-γ(e - T_mid)))
             if hasattr(dataset, 'set_x4k_prob'):
-                p_max = 0.5  # max 50% X4K (1:1 ratio)
-                gamma = 0.2
-                x4k_prob = p_max / (1.0 + math.exp(-gamma * (epoch - curriculum_T)))
+                x4k_prob = 0.5 / (1.0 + math.exp(-0.2 * (epoch - curriculum_T)))
                 dataset.set_x4k_prob(x4k_prob)
-                if local_rank == 0 and epoch % 10 == 0:
-                    print(f"Curriculum: epoch {epoch}, X4K prob={x4k_prob:.3f}")
         
-        # Use tqdm for progress bar
         pbar = tqdm(train_data, desc=f"Epoch {epoch}", disable=(local_rank != 0))
-        if grad_accum > 1:
-            model.optimG.zero_grad()
         for i, imgs in enumerate(pbar):
-            data_time_interval = time.time() - time_stamp
-            time_stamp = time.time()
+            if args.dry_run and i >= 10: break # Exit early for dry run
             imgs = imgs.to(device, non_blocking=True) / 255.
             imgs, gt = imgs[:, 0:6], imgs[:, 6:]
             learning_rate = get_learning_rate(step, step_per_epoch, total_epochs, base_lr=lr)
+            
             if grad_accum > 1:
                 _, loss_dict = model.update(imgs, gt, learning_rate, training=True, accumulate=True)
                 if (i + 1) % grad_accum == 0 or (i + 1) == len(train_data):
                     model.accum_step()
-                    model.optimG.zero_grad()
             else:
                 _, loss_dict = model.update(imgs, gt, learning_rate, training=True)
-            train_time_interval = time.time() - time_stamp
-            time_stamp = time.time()
             
             if step % 200 == 1 and local_rank == 0 and writer is not None:
                 writer.add_scalar('learning_rate', learning_rate, step)
-                for k, v in loss_dict.items():
-                    writer.add_scalar(f'loss/{k}', v, step)
+                for k, v in loss_dict.items(): writer.add_scalar(f'loss/{k}', v, step)
             
-            # Update tqdm postfix instead of print
             if local_rank == 0:
                 pbar.set_postfix({'loss': f'{loss_dict.get("loss_total", 0):.4e}', 'lr': f'{learning_rate:.2e}'})
-                
             step += 1
+            
         nr_eval += 1
         if nr_eval % eval_interval == 0:
-            evaluate(model, val_data, nr_eval, local_rank, writer_val=writer_val, best_psnr_holder=best_psnr_holder)
+            evaluate(model, val_data, nr_eval, local_rank, writer_val=writer_val, best_psnr_holder=best_psnr_holder, dry_run=args.dry_run)
+        
         train_state = {'epoch': epoch, 'step': step, 'nr_eval': nr_eval, 'best_psnr': best_psnr_holder['val']}
         model.save_model(local_rank, train_state=train_state)    
         dist.barrier()
 
-def evaluate(model, val_data, nr_eval, local_rank, writer_val=None, best_psnr_holder=None):
-    if best_psnr_holder is None:
-        best_psnr_holder = {'val': 0.0}
-
-    psnr_list = []
-    ssim_list = []
-    for _, imgs in enumerate(val_data):
+def evaluate(model, val_data, nr_eval, local_rank, writer_val=None, best_psnr_holder=None, dry_run=False):
+    psnr_list, ssim_list = [], []
+    for i, imgs in enumerate(val_data):
+        if dry_run and i >= 2: break # Only 2 samples for dry run
         imgs = imgs.to(device, non_blocking=True) / 255.
         imgs, gt = imgs[:, 0:6], imgs[:, 6:]
         with torch.no_grad():
             pred, _ = model.update(imgs, gt, training=False)
         for j in range(gt.shape[0]):
-            psnr_list.append(-10 * math.log10(((gt[j] - pred[j]) * (gt[j] - pred[j])).mean().cpu().item()))
+            psnr_list.append(-10 * math.log10(((gt[j] - pred[j])**2).mean().cpu().item()))
             ssim_list.append(ssim_matlab(gt[j:j+1], pred[j:j+1]).cpu().item())
-        # Explicitly delete loop tensors
         del imgs, gt, pred
    
-    avg_psnr = np.array(psnr_list).mean()
-    avg_ssim = np.array(ssim_list).mean()
+    avg_psnr, avg_ssim = np.mean(psnr_list), np.mean(ssim_list)
     if local_rank == 0:
         print(f"Evaluation Epoch {nr_eval}, PSNR: {avg_psnr:.4f}, SSIM: {avg_ssim:.4f}")
-        if writer_val is not None:
+        if writer_val:
             writer_val.add_scalar('psnr', avg_psnr, nr_eval)
             writer_val.add_scalar('ssim', avg_ssim, nr_eval)
-        # Save best model
         if avg_psnr > best_psnr_holder['val']:
             best_psnr_holder['val'] = avg_psnr
             model.save_model(rank=0, suffix='_best')
-            print(f"  ★ New best PSNR: {avg_psnr:.4f}, saved as ckpt/{model.name}_best.pkl")
-    
-    # Cleanup after evaluation
+            print(f"  ★ New best PSNR: {avg_psnr:.4f}")
     torch.cuda.empty_cache()
         
 if __name__ == "__main__":    
     parser = argparse.ArgumentParser()
-    parser.add_argument('--local_rank', default=0, type=int, help='local rank')
-    parser.add_argument('--local-rank', default=0, type=int, help='local rank')
-    parser.add_argument('--world_size', default=1, type=int, help='world size')
-    parser.add_argument('--batch_size', default=8, type=int, help='batch size')
-    parser.add_argument('--data_path', type=str, required=True, help='data path of vimeo90k')
-    parser.add_argument('--x4k_path', type=str, default=None, help='data path of x4k1000fps')
-    parser.add_argument('--mixed_ratio', type=str, default="2:1", help='Mixed ratio Vimeo:X4K (e.g. 2:1)')
-    parser.add_argument('--crop_size', type=int, default=256, help='Training crop size (default: 256)')
-    parser.add_argument('--lr', type=float, default=2e-4, help='Learning rate')
-    parser.add_argument('--num_workers', type=int, default=8, help='DataLoader num_workers')
-    parser.add_argument('--grad_accum', type=int, default=1, help='Gradient accumulation steps (effective batch = batch_size * grad_accum)')
-    parser.add_argument('--eval_interval', type=int, default=3, help='Evaluate every N epochs (default: 3)')
-    # Phase control
-    parser.add_argument('--phase', type=int, default=1, choices=[1, 2, 3], help='Training phase (1/2/3)')
-    # Ablation experiment control
-    parser.add_argument('--exp_name', type=str, default=None, help='Experiment name (overrides phase config)')
-    parser.add_argument('--backbone_mode', type=str, default='hybrid', 
-                        choices=['hybrid', 'mamba2_only', 'gated_attn_only'],
-                        help='Backbone mode for ablation')
-    parser.add_argument('--use_mhc', action='store_true', help='Use Manifold Hyper-Connections')
-    parser.add_argument('--use_ecab', action=argparse.BooleanOptionalAction, default=True, help='Use ECAB (default: True, --no-use_ecab to disable)')
-    parser.add_argument('--backbone_v2', action='store_true', help='Use V2 backbone (Factorized SSM + CrossGating)')
-    parser.add_argument('--backbone_v3', action='store_true', help='Use V3 backbone (Factorized SSM + NSS Scan + CrossGating)')
-    parser.add_argument('--v3_variant', type=str, default=None, choices=['hp', 'ultra'],
-                        help='V3 backbone variant: hp (F=48,d=[3,3,3],5.38M) or ultra (F=64,d=[4,4,4],10.37M)')
-    parser.add_argument('--cross_gating', action='store_true', help='Use CrossGating fusion (V1 backbone upgrade)')
-    # Training control
-    parser.add_argument('--epochs', type=int, default=300, help='Number of epochs')
-    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
-    parser.add_argument('--freeze_backbone', type=int, default=0, help='Freeze backbone for N epochs (Phase 2)')
-    parser.add_argument('--backbone_lr_scale', type=float, default=1.0, help='Backbone LR multiplier (e.g. 0.1 for discriminative LR)')
-    parser.add_argument('--dry_run', action='store_true', help='Quick sanity check (1 epoch)')
-    # Curriculum learning (Phase 3)
-    parser.add_argument('--curriculum', action='store_true', help='Enable curriculum learning')
-    parser.add_argument('--curriculum_T', type=int, default=50, help='Curriculum transition epoch')
+    parser.add_argument('--local_rank', default=0, type=int)
+    parser.add_argument('--world_size', default=1, type=int)
+    parser.add_argument('--batch_size', default=8, type=int)
+    parser.add_argument('--data_path', type=str, required=True)
+    parser.add_argument('--x4k_path', type=str, default=None)
+    parser.add_argument('--mixed_ratio', type=str, default="2:1")
+    parser.add_argument('--crop_size', type=int, default=256)
+    parser.add_argument('--lr', type=float, default=2e-4)
+    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--grad_accum', type=int, default=1)
+    parser.add_argument('--eval_interval', type=int, default=3)
+    parser.add_argument('--phase', type=int, default=1, choices=[1, 2, 3])
+    parser.add_argument('--variant', type=str, default='base', choices=['base', 'hp', 'ultra'])
+    parser.add_argument('--exp_name', type=str, default=None)
+    parser.add_argument('--epochs', type=int, default=300)
+    parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--freeze_backbone', type=int, default=0)
+    parser.add_argument('--backbone_lr_scale', type=float, default=1.0)
+    parser.add_argument('--dry_run', action='store_true')
+    parser.add_argument('--curriculum', action='store_true')
+    parser.add_argument('--curriculum_T', type=int, default=50)
     args = parser.parse_args()
     
-    if 'LOCAL_RANK' in os.environ:
-        local_rank = int(os.environ['LOCAL_RANK'])
-    else:
-        local_rank = args.local_rank
-    
+    local_rank = int(os.environ.get('LOCAL_RANK', args.local_rank))
     v_w, x_w = map(int, args.mixed_ratio.split(':'))
     
-    # =============================================================================
-    # Configure MODEL_CONFIG based on phase and arguments
-    # =============================================================================
-    if args.phase == 1:
-        if args.backbone_v3:
-            if args.v3_variant == 'hp':
-                base_config = PHASE1_V3_HP_CONFIG.copy()
-            elif args.v3_variant == 'ultra':
-                base_config = PHASE1_V3_ULTRA_CONFIG.copy()
-            else:
-                base_config = PHASE1_V3_CONFIG.copy()
-        elif args.backbone_v2:
-            base_config = PHASE1_V2_CONFIG.copy()
-        else:
-            base_config = PHASE1_CONFIG.copy()
-    elif args.phase == 2:
-        if args.backbone_v3:
-            if args.v3_variant == 'hp':
-                base_config = PHASE2_V3_HP_CONFIG.copy()
-            elif args.v3_variant == 'ultra':
-                base_config = PHASE2_V3_ULTRA_CONFIG.copy()
-            else:
-                base_config = PHASE2_V3_CONFIG.copy()
-        elif args.backbone_v2:
-            base_config = PHASE2_V2_CONFIG.copy()
-        elif args.cross_gating:
-            base_config = PHASE2_CG_CONFIG.copy()
-        else:
-            base_config = PHASE2_CONFIG.copy()
-    elif args.phase == 3:
-        base_config = PHASE3_CONFIG.copy()
-    else:
-        base_config = MODEL_CONFIG.copy()
-    
-    # Override with ablation config if exp_name matches
-    if args.exp_name and args.exp_name in ABLATION_CONFIGS:
-        ablation_arch = ABLATION_CONFIGS[args.exp_name].copy()
-        ablation_arch['use_flow'] = base_config.get('USE_FLOW', False)
-        base_config['MODEL_ARCH'] = ablation_arch
-        base_config['LOGNAME'] = args.exp_name
-    elif args.exp_name:
-        # Custom experiment name
-        base_config['LOGNAME'] = args.exp_name
-        base_config['MODEL_ARCH'] = {**init_model_config(
-            F=32, W=8, depth=[2,2,2],
-            backbone_mode=args.backbone_mode,
-            use_mhc=args.use_mhc,
-            use_ecab=args.use_ecab
-        ), 'use_flow': base_config.get('USE_FLOW', False)}
-    
-    # Update global MODEL_CONFIG
-    MODEL_CONFIG.update(base_config)
-    
-    if local_rank == 0:
-        print(f"=== Training Configuration ===")
-        print(f"Phase: {args.phase}")
-        print(f"Experiment: {MODEL_CONFIG['LOGNAME']}")
-        print(f"Backbone Mode: {MODEL_CONFIG['MODEL_ARCH'].get('backbone_mode', 'hybrid')}")
-        print(f"USE_FLOW: {MODEL_CONFIG['USE_FLOW']}")
-        print(f"USE_X4K_TRAINING: {MODEL_CONFIG['USE_X4K_TRAINING']}")
-        print(f"==============================")
+    # Unified Config Generation
+    project_config.MODEL_CONFIG = project_config.get_phase_config(args.phase, args.variant)
+    if args.exp_name: project_config.MODEL_CONFIG['LOGNAME'] = args.exp_name
     
     dist.init_process_group(backend="nccl", world_size=args.world_size, rank=local_rank)
     torch.cuda.set_device(local_rank)
     
-    if local_rank == 0 and not os.path.exists('log'):
-        os.mkdir('log')
-    if local_rank == 0 and not os.path.exists('ckpt'):
-        os.mkdir('ckpt')
-        
     seed = 1234
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = True
     
     model = Model(local_rank, backbone_lr_scale=args.backbone_lr_scale)
     
-    # Resume from checkpoint: prefer current experiment's own checkpoint (crash recovery),
-    # fall back to --resume (initial Phase 1→2 transition)
-    own_ckpt = f'ckpt/{MODEL_CONFIG["LOGNAME"]}.pkl'
-    if os.path.exists(own_ckpt):
-        if local_rank == 0:
-            print(f"Found own checkpoint {own_ckpt}, resuming (crash recovery)")
-        model.load_model(name=MODEL_CONFIG["LOGNAME"])
+    # Auto-resume logic
+    if os.path.exists(f'ckpt/{project_config.MODEL_CONFIG["LOGNAME"]}.pkl'):
+        model.load_model(name=project_config.MODEL_CONFIG["LOGNAME"])
     elif args.resume:
-        if local_rank == 0:
-            print(f"Resuming from {args.resume}")
-        model.load_model(name=args.resume.replace('.pkl', '').replace('ckpt/', ''))
-    
-    # Freeze backbone if specified (Phase 2 fine-tuning)
-    freeze_epochs = args.freeze_backbone
-    if freeze_epochs > 0 and local_rank == 0:
-        print(f"Will freeze backbone for first {freeze_epochs} epochs")
-    
-    # Dry run mode
-    epochs = 1 if args.dry_run else args.epochs
+        model.load_model(name=args.resume.replace('.pkl', ''))
     
     train(model, local_rank, args.batch_size, args.data_path, args.x4k_path, 
-          mixed_ratio=(v_w, x_w), freeze_epochs=freeze_epochs, total_epochs=epochs,
+          mixed_ratio=(v_w, x_w), freeze_epochs=args.freeze_backbone, 
+          total_epochs=(1 if args.dry_run else args.epochs),
           curriculum=args.curriculum, curriculum_T=args.curriculum_T,
           crop_size=args.crop_size, lr=args.lr, num_workers=args.num_workers,
           grad_accum=args.grad_accum, eval_interval=args.eval_interval)

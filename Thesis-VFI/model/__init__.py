@@ -1,6 +1,4 @@
 from .backbone import build_backbone
-from .backbone_v2 import build_backbone_v2
-from .backbone_v3 import build_backbone_v3
 from .flow import build_flow_estimator
 from .refine import build_refine_net
 from .warplayer import warp
@@ -54,13 +52,8 @@ class ContextNet(nn.Module):
 class ThesisModel(nn.Module):
     def __init__(self, cfg):
         super(ThesisModel, self).__init__()
-        # Select backbone version: V3 (NSS) > V2 (factorized) > V1 (interleaved)
-        if cfg.get('use_backbone_v3', False):
-            self.backbone = build_backbone_v3(cfg)
-        elif cfg.get('use_backbone_v2', False):
-            self.backbone = build_backbone_v2(cfg)
-        else:
-            self.backbone = build_backbone(cfg)
+        # Unified Backbone (NSS + CrossGating)
+        self.backbone = build_backbone(cfg)
         
         self.use_flow = cfg.get('use_flow', False)
         if self.use_flow:
@@ -123,13 +116,6 @@ class ThesisModel(nn.Module):
     def inference(self, img0, img1, TTA=False, scale=1.0, timestep=0.5, fast_TTA=False):
         """
         Inference with Test Time Augmentation (TTA) support.
-        
-        TTA Modes:
-        - TTA=False: Standard forward pass
-        - TTA=True, fast_TTA=False: Full TTA (H-flip + V-flip + Transpose) = 8 augmentations
-        - TTA=True, fast_TTA=True: Fast TTA (H-flip only) = 2 augmentations
-        
-        Reference: RIFE, VFIMamba use H-flip for TTA
         """
         # Scale handling for high-resolution
         if scale != 1.0:

@@ -2,196 +2,63 @@ from functools import partial
 import torch.nn as nn
 
 '''==========Model config=========='''
-def init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid', use_mhc=False, use_ecab=True):
+def init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid', use_ecab=True):
     '''
-    Configuration for the Hybrid Backbone.
-    
-    Args:
-        F: Base feature dimension
-        W: Window size for attention
-        depth: Number of blocks per stage
-        backbone_mode: 'hybrid' | 'mamba2_only' | 'gated_attn_only'
-        use_mhc: Whether to use Manifold Hyper-Connections
-        use_ecab: Whether to use ECAB (vs standard CAB)
+    Unified Configuration for the NSS-based Hybrid Backbone.
     '''
     return { 
-        'embed_dims': [F, 2*F, 4*F],  # 3 scales
-        'num_heads': [2, 4, 8],        # Heads per scale
+        'embed_dims': [F, 2*F, 4*F],
+        'num_heads': [F//16, F//8, F//4], # Scales heads with F
         'mlp_ratios': [4, 4, 4],
         'qkv_bias': True,
         'norm_layer': partial(nn.LayerNorm, eps=1e-6), 
         'depths': depth,
         'window_sizes': [W, W, W],
-        # Ablation control
-        'backbone_mode': backbone_mode,  # 'hybrid', 'mamba2_only', 'gated_attn_only'
-        'use_mhc': use_mhc,
+        'backbone_mode': backbone_mode,
         'use_ecab': use_ecab,
+        'num_scan_dirs': 4,
+        'stripe_width': 4,
+        'use_checkpointing': True
     }
 
 # =============================================================================
-# Phase-specific Configurations
+# Model Variants (NSS + CrossGating)
 # =============================================================================
 
-PHASE1_CONFIG = {
-    'LOGNAME': 'phase1_hybrid',
-    'PHASE': 1,
-    'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'), 'use_flow': False},
-    'USE_FLOW': False,
-    'USE_X4K_TRAINING': False,
+VARIANTS = {
+    'base':  init_model_config(F=32, W=8, depth=[2, 2, 2]),
+    'hp':    init_model_config(F=48, W=8, depth=[3, 3, 3]),
+    'ultra': init_model_config(F=64, W=8, depth=[4, 4, 4])
 }
 
-# Phase 1 V2: Factorized SSM + CrossGating
-PHASE1_V2_CONFIG = {
-    'LOGNAME': 'phase1_factorized_v2',
-    'PHASE': 1,
-    'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'),
-                   'use_flow': False, 'use_backbone_v2': True},
-    'USE_FLOW': False,
-    'USE_X4K_TRAINING': False,
-}
-
-# Phase 1 V3: Factorized SSM + NSS Scan + CrossGating
-PHASE1_V3_CONFIG = {
-    'LOGNAME': 'phase1_nss_v3',
-    'PHASE': 1,
-    'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'),
-                   'use_flow': False, 'use_backbone_v3': True,
-                   'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True},
-    'USE_FLOW': False,
-    'USE_X4K_TRAINING': False,
-}
-
-# Phase 1 V3-HP: High-Performance (F=48, d=[3,3,3], ~5.38M params)
-PHASE1_V3_HP_CONFIG = {
-    'LOGNAME': 'phase1_nss_v3_hp',
-    'PHASE': 1,
-    'MODEL_ARCH': {**init_model_config(F=48, W=8, depth=[3, 3, 3], backbone_mode='hybrid'),
-                   'num_heads': [3, 6, 12],
-                   'use_flow': False, 'use_backbone_v3': True,
-                   'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True,
-                   'mamba_headdim': 32},
-    'USE_FLOW': False,
-    'USE_X4K_TRAINING': False,
-}
-
-# Phase 1 V3-Ultra: Maximum capacity (F=64, d=[4,4,4], ~10.37M params)
-PHASE1_V3_ULTRA_CONFIG = {
-    'LOGNAME': 'phase1_nss_v3_ultra',
-    'PHASE': 1,
-    'MODEL_ARCH': {**init_model_config(F=64, W=8, depth=[4, 4, 4], backbone_mode='hybrid'),
-                   'num_heads': [4, 8, 16],
-                   'use_flow': False, 'use_backbone_v3': True,
-                   'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True},
-    'USE_FLOW': False,
-    'USE_X4K_TRAINING': False,
-}
-
-PHASE2_CONFIG = {
-    'LOGNAME': 'phase2_flow',
-    'PHASE': 2,
-    'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'), 'use_flow': True},
-    'USE_FLOW': True,
-    'USE_X4K_TRAINING': False,
-}
-
-# Phase 2 with CrossGating Fusion upgrade
-PHASE2_CG_CONFIG = {
-    'LOGNAME': 'phase2_crossgating',
-    'PHASE': 2,
-    'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'),
-                   'use_flow': True, 'use_cross_gating': True, 'use_checkpointing': True},
-    'USE_FLOW': True,
-    'USE_X4K_TRAINING': False,
-}
-
-# Phase 2 V2: Factorized backbone + flow
-PHASE2_V2_CONFIG = {
-    'LOGNAME': 'phase2_factorized_flow',
-    'PHASE': 2,
-    'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'),
-                   'use_flow': True, 'use_backbone_v2': True},
-    'USE_FLOW': True,
-    'USE_X4K_TRAINING': False,
-}
-
-# Phase 2 V3: NSS backbone + flow
-PHASE2_V3_CONFIG = {
-    'LOGNAME': 'phase2_nss_flow',
-    'PHASE': 2,
-    'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'),
-                   'use_flow': True, 'use_backbone_v3': True,
-                   'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True},
-    'USE_FLOW': True,
-    'USE_X4K_TRAINING': False,
-}
-
-# Phase 2 V3-HP: NSS HP backbone + flow
-PHASE2_V3_HP_CONFIG = {
-    'LOGNAME': 'phase2_nss_flow_hp',
-    'PHASE': 2,
-    'MODEL_ARCH': {**init_model_config(F=48, W=8, depth=[3, 3, 3], backbone_mode='hybrid'),
-                   'num_heads': [3, 6, 12],
-                   'use_flow': True, 'use_backbone_v3': True,
-                   'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True,
-                   'mamba_headdim': 32},
-    'USE_FLOW': True,
-    'USE_X4K_TRAINING': False,
-}
-
-# Phase 2 V3-Ultra: NSS Ultra backbone + flow
-PHASE2_V3_ULTRA_CONFIG = {
-    'LOGNAME': 'phase2_nss_flow_ultra',
-    'PHASE': 2,
-    'MODEL_ARCH': {**init_model_config(F=64, W=8, depth=[4, 4, 4], backbone_mode='hybrid'),
-                   'num_heads': [4, 8, 16],
-                   'use_flow': True, 'use_backbone_v3': True,
-                   'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True},
-    'USE_FLOW': True,
-    'USE_X4K_TRAINING': False,
-}
-
-PHASE3_CONFIG = {
-    'LOGNAME': 'phase3_4k',
-    'PHASE': 3,
-    'MODEL_ARCH': {**init_model_config(F=32, W=8, depth=[2, 2, 2], backbone_mode='hybrid'),
-                   'use_flow': True, 'use_backbone_v3': True,
-                   'num_scan_dirs': 4, 'stripe_width': 4, 'use_checkpointing': True},
-    'USE_FLOW': True,
-    'USE_X4K_TRAINING': True,
-}
+# Update heads for specific variants to match research plan
+VARIANTS['hp']['num_heads'] = [3, 6, 12]
+VARIANTS['ultra']['num_heads'] = [4, 8, 16]
 
 # =============================================================================
-# Ablation Experiment Configurations (Phase 1)
+# Phase configurations
 # =============================================================================
 
-ABLATION_CONFIGS = {
-    # Exp-1a: Pure Mamba2 (no attention)
-    'exp1a_mamba2_only': init_model_config(F=32, W=8, depth=[2,2,2], backbone_mode='mamba2_only'),
-    # Exp-1b: Pure Gated Window Attention (no SSM)
-    'exp1b_gated_attn_only': init_model_config(F=32, W=8, depth=[2,2,2], backbone_mode='gated_attn_only'),
-    # Exp-1c: Hybrid LGS Block (main)
-    'exp1c_hybrid': init_model_config(F=32, W=8, depth=[2,2,2], backbone_mode='hybrid'),
-    # Exp-1f: ECAB vs CAB
-    'exp1f_ecab': init_model_config(F=32, W=8, depth=[2,2,2], backbone_mode='hybrid', use_ecab=True),
-    'exp1f_cab': init_model_config(F=32, W=8, depth=[2,2,2], backbone_mode='hybrid', use_ecab=False),
-    # Exp-1g: Gated vs Non-gated (handled in GatedWindowAttention)
-    'exp1g_gated': init_model_config(F=32, W=8, depth=[2,2,2], backbone_mode='hybrid'),
-    # Exp-1h: mHC vs Standard Residual
-    'exp1h_mhc': init_model_config(F=32, W=8, depth=[2,2,2], backbone_mode='hybrid', use_mhc=True),
-    'exp1h_standard': init_model_config(F=32, W=8, depth=[2,2,2], backbone_mode='hybrid', use_mhc=False),
-    # Exp-1i: Window size ablation
-    'exp1i_win7': init_model_config(F=32, W=7, depth=[2,2,2], backbone_mode='hybrid'),
-    'exp1i_win14': init_model_config(F=32, W=14, depth=[2,2,2], backbone_mode='hybrid'),
-}
+def get_phase_config(phase, variant='base'):
+    cfg = VARIANTS[variant].copy()
+    
+    if phase == 1:
+        logname = f'phase1_nss_{variant}'
+        use_flow = False
+    elif phase == 2:
+        logname = f'phase2_nss_flow_{variant}'
+        use_flow = True
+    else:
+        logname = f'phase3_4k_{variant}'
+        use_flow = True
+        
+    return {
+        'LOGNAME': logname,
+        'PHASE': phase,
+        'MODEL_ARCH': {**cfg, 'use_flow': use_flow},
+        'USE_FLOW': use_flow,
+        'USE_X4K_TRAINING': (phase == 3)
+    }
 
-# Default active config (can be overridden by train.py args)
-MODEL_CONFIG = {
-    'LOGNAME': 'hybrid_v1_baseline',
-    'MODEL_ARCH': {**init_model_config(
-        F = 32,
-        W = 8,
-        depth = [2, 2, 2]
-    ), 'use_flow': False},
-    'USE_FLOW': False,
-    'USE_X4K_TRAINING': False
-}
+# Default placeholder
+MODEL_CONFIG = get_phase_config(1, 'base')
