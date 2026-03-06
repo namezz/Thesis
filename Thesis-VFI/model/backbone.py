@@ -206,9 +206,8 @@ class LGSBlock(nn.Module):
         
         # Fusion and Post-processing
         if backbone_mode == 'hybrid':
-            self.cross_gate = CrossGatingFusion(self.half_dim)
-            # Projection to restore full dim if we used splitting
-            self.out_proj = nn.Conv2d(self.half_dim, dim, kernel_size=1)
+            # CrossGating now directly projects to the full dimension
+            self.cross_gate = CrossGatingFusion(self.half_dim, d_out=dim)
         
         self.cab = ECAB(dim) if use_ecab else nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dim, dim // 4, 1), nn.ReLU(True), nn.Conv2d(dim // 4, dim, 1), nn.Sigmoid())
         self.use_ecab = use_ecab
@@ -255,10 +254,9 @@ class LGSBlock(nn.Module):
             # Fusion
             fm_2d = xm.transpose(1, 2).view(twoB, self.half_dim, H, W)
             fa_2d = xa.transpose(1, 2).view(twoB, self.half_dim, H, W)
-            x_fused = self.cross_gate(fm_2d, fa_2d) # [2B, C/2, H, W]
+            x_fused = self.cross_gate(fm_2d, fa_2d) # [2B, C, H, W] - Already full dim
             
-            # Project back to full dim and APPLY ECAB (Fixing the bug!)
-            x_fused = self.out_proj(x_fused)
+            # APPLY ECAB (Fixing the bug!)
             x_fused = self._apply_cab(x_fused)
             
             x_fused = x_fused.flatten(2).transpose(1, 2)
@@ -317,17 +315,34 @@ class HybridBackbone(nn.Module):
     def forward(self, img0, img1):
         B_orig = img0.shape[0]
         x = self.patch_embed(torch.cat([img0, img1], 0))
-        outs, twoB, _, H, W = [], *x.shape
+        
+        outs_merged = []
+        outs_per_frame = [] # To store (f0, f1) pairs for flow estimation
+        
+        twoB, _, H, W = x.shape
         x = x.flatten(2).transpose(1, 2)
+        
         for i, l in enumerate(self.layers):
             x, H, W = l(x, H, W)
             x_out = x.transpose(1, 2).view(twoB, -1, H, W)
-            outs.append(self.merge_convs[i](torch.cat([x_out[:B_orig], x_out[B_orig:]], 1)))
+            
+            # Extract per-frame features (view, no memory copy)
+            x_f0 = x_out[:B_orig]
+            x_f1 = x_out[B_orig:]
+            
+            # Path 1: Merged features for RefineNet
+            x_merged = self.merge_convs[i](torch.cat([x_f0, x_f1], 1))
+            outs_merged.append(x_merged)
+            
+            # Path 2: Per-frame pairs for Flow Estimator
+            outs_per_frame.append((x_f0, x_f1))
+            
             if i < self.num_layers - 1:
                 x_down = self.downsamplers[i](x_out)
                 _, _, H, W = x_down.shape
                 x = x_down.flatten(2).transpose(1, 2)
-        return outs
+                
+        return outs_merged, outs_per_frame
 
     def load_legacy_weights(self, state_dict):
         own = self.state_dict()

@@ -325,10 +325,13 @@ class CrossGatingFusion(nn.Module):
     """
     Bi-directional Cross-Gating Fusion for Mamba2 + Attention branch outputs.
     Upgraded with 3x3 Depthwise Convolutions for spatial-aware gating.
+    Optimized to project to output dimension directly.
     """
-    def __init__(self, d_model):
+    def __init__(self, d_model, d_out=None):
         super().__init__()
         self.d_model = d_model
+        d_out = d_out or d_model
+        
         # Gate: Mamba features -> gate for Attention branch (Spatial-aware)
         self.gate_mamba_to_attn = nn.Sequential(
             nn.Conv2d(d_model, d_model, kernel_size=3, padding=1, groups=d_model),
@@ -343,23 +346,15 @@ class CrossGatingFusion(nn.Module):
             nn.GELU(),
             nn.Conv2d(d_model // 2, d_model, kernel_size=1)
         )
-        # Concatenate gated features and project back
-        self.out_proj = nn.Conv2d(d_model * 2, d_model, kernel_size=1)
+        # Concatenate gated features and project back to FULL dimension
+        self.out_proj = nn.Conv2d(d_model * 2, d_out, kernel_size=1)
 
     def forward(self, f_mamba, f_attn):
-        """
-        Args:
-            f_mamba: (B, C, H, W) Mamba2 branch output (global structure + temporal)
-            f_attn:  (B, C, H, W) Attention branch output (local texture + edges)
-        Returns:
-            (B, C, H, W) fused features
-        """
         gate_from_mamba = torch.sigmoid(self.gate_mamba_to_attn(f_mamba))
         gate_from_attn = torch.sigmoid(self.gate_attn_to_mamba(f_attn))
         f_mamba_gated = f_mamba * gate_from_attn
         f_attn_gated = f_attn * gate_from_mamba
-        f_fused = torch.cat([f_mamba_gated, f_attn_gated], dim=1)
-        return self.out_proj(f_fused)
+        return self.out_proj(torch.cat([f_mamba_gated, f_attn_gated], dim=1))
 
 
 # ════════════════════════════════════════════════════════════════════════════

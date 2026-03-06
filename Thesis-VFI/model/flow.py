@@ -202,22 +202,7 @@ class FlowRefineBlock(nn.Module):
 class OpticalFlowEstimator(nn.Module):
     """
     Feature-guided coarse-to-fine optical flow estimator.
-
-    Unlike RIFE's IFNet which re-extracts features from raw images at each scale,
-    this module directly consumes the multi-scale features from the hybrid backbone.
-
-    Data flow:
-        backbone features [s0, s1, s2] (fine → coarse)
-              ↓
-        Stage 0: feat_s2 → FlowInitBlock → flow_0 (coarsest)
-              ↓ upsample flow
-        Stage 1: feat_s1 + warp(feat_s1, flow) → FlowRefineBlock → flow_1
-              ↓ upsample flow
-        Stage 2: feat_s0 + warp(feat_s0 + img, flow) → FlowRefineBlock → flow_2 (finest)
-
-    Args:
-        embed_dims: list of backbone feature dimensions, e.g. [32, 64, 128]
-        hidden_dims: hidden channels for each flow stage
+    Now receives per-frame feature pairs from the backbone for real matching.
     """
     def __init__(self, embed_dims=[32, 64, 128], hidden_dims=None):
         super().__init__()
@@ -244,11 +229,6 @@ class OpticalFlowEstimator(nn.Module):
                 use_img=use_img,
             ))
 
-        # Lightweight projection layers to align backbone feature dims
-        self.feat_projs = nn.ModuleList([
-            nn.Identity() for _ in range(self.num_scales)
-        ])
-
     def _make_timestep_map(self, ref_tensor, timestep):
         """Create timestep spatial map matching ref_tensor's spatial size."""
         B, _, H, W = ref_tensor.shape
@@ -268,7 +248,7 @@ class OpticalFlowEstimator(nn.Module):
         scale_y = target_h / h
         flow_resized = F.interpolate(flow, size=(target_h, target_w),
                                      mode='bilinear', align_corners=False)
-        # Rescale flow magnitude: x-component by scale_x, y-component by scale_y
+        # Rescale flow magnitude
         flow_resized[:, 0] *= scale_x  # flow_01_x
         flow_resized[:, 1] *= scale_y  # flow_01_y
         flow_resized[:, 2] *= scale_x  # flow_10_x
@@ -285,49 +265,34 @@ class OpticalFlowEstimator(nn.Module):
     def forward(self, backbone_feats, img0, img1, timestep=0.5):
         """
         Args:
-            backbone_feats: list of (B, C_i, H_i, W_i) from backbone
-                            [scale0_finest, scale1_mid, scale2_coarsest]
-            img0, img1:     (B, 3, H, W) original images in [0, 1]
-            timestep:       float or (B, 1, 1, 1) tensor
-
-        Returns:
-            flow_01:     (B, 2, H, W) — forward flow (frame 0 → frame 1)
-            flow_10:     (B, 2, H, W) — backward flow (frame 1 → frame 0)
-            mask:        (B, 1, H, W) — blending logits (pre-sigmoid)
-            flow_list:   list of per-scale flow tensors (for multi-scale loss)
+            backbone_feats: list of tuples [(f0_s0, f1_s0), (f0_s1, f1_s1), (f0_s2, f1_s2)]
         """
-        # Reverse to coarse→fine order for processing
-        feats_c2f = list(reversed(backbone_feats))  # [coarsest, ..., finest]
-
-        # Project features (identity by default)
-        feats_c2f = [self.feat_projs[self.num_scales - 1 - i](f)
-                     for i, f in enumerate(feats_c2f)]
+        # Reverse to coarse→fine order
+        feats_c2f = list(reversed(backbone_feats))  # [(f0_coarsest, f1_coarsest), ...]
 
         flow_list = []
 
-        # --- Stage 0: Initial flow from coarsest backbone features ---
-        feat0_s = feats_c2f[0]
+        # --- Stage 0: Initial flow using TRUE per-frame features ---
+        feat0_s, feat1_s = feats_c2f[0]
         t_map = self._make_timestep_map(feat0_s, timestep)
-        # Note: backbone outputs merged frame features. For explicit per-frame
-        # features, the backbone should return them separately (future work).
-        # Here we use merged features duplicated as a baseline.
-        flow, mask = self.init_block(feat0_s, feat0_s, t_map)
+        
+        flow, mask = self.init_block(feat0_s, feat1_s, t_map)
         flow_list.append(flow)
 
         # --- Stage 1+: Coarse-to-fine refinement ---
         for i, refine_block in enumerate(self.refine_blocks):
-            feat_next = feats_c2f[i + 1]  # next finer scale features
-            _, _, H_next, W_next = feat_next.shape
+            f0_next, f1_next = feats_c2f[i + 1]
+            _, _, H_next, W_next = f0_next.shape
 
-            # Upsample flow and mask to next scale
+            # Upsample flow and mask
             flow = self._resize_flow(flow, H_next, W_next)
             mask = self._resize_mask(mask, H_next, W_next)
-            t_map = self._make_timestep_map(feat_next, timestep)
+            t_map = self._make_timestep_map(f0_next, timestep)
 
             # Refine
             is_finest = (i == len(self.refine_blocks) - 1)
             flow_delta, mask_delta = refine_block(
-                feat_next, feat_next, flow, mask, t_map,
+                f0_next, f1_next, flow, mask, t_map,
                 img0=img0 if is_finest else None,
                 img1=img1 if is_finest else None,
             )
@@ -336,16 +301,12 @@ class OpticalFlowEstimator(nn.Module):
             mask = mask + mask_delta
             flow_list.append(flow)
 
-        # --- Upsample to full image resolution if needed ---
+        # Final upsample to full resolution
         full_H, full_W = img0.shape[-2:]
         flow = self._resize_flow(flow, full_H, full_W)
         mask = self._resize_mask(mask, full_H, full_W)
 
-        # Split into explicit forward/backward flows
-        flow_01 = flow[:, :2]   # (B, 2, H, W) — frame 0 → frame 1
-        flow_10 = flow[:, 2:4]  # (B, 2, H, W) — frame 1 → frame 0
-
-        return flow_01, flow_10, mask, flow_list
+        return flow[:, :2], flow[:, 2:4], mask, flow_list
 
 
 # ════════════════════════════════════════════════════════════════════════════

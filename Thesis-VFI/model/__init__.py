@@ -73,14 +73,14 @@ class ThesisModel(nn.Module):
     def forward(self, x, timestep=0.5):
         img0, img1 = x[:, :3], x[:, 3:6]
         
+        # Backbone returns both merged features and raw per-frame pairs
+        feats_merged, feats_per_frame = self.backbone(img0, img1)
+
         if self.use_flow:
             # Phase 2: Flow-guided feature warping
-            # Backbone processes ORIGINAL frames (cross-frame attention on unwarped content)
-            feats = self.backbone(img0, img1)
-
-            # Flow estimator uses backbone features for feature-guided estimation
+            # Flow estimator uses per-frame features for real matching
             flow_01, flow_10, flow_mask, flow_list = self.flow_estimator(
-                feats, img0, img1, timestep=timestep
+                feats_per_frame, img0, img1, timestep=timestep
             )
 
             # Warp images and blend using flow mask
@@ -93,23 +93,20 @@ class ThesisModel(nn.Module):
             ctx0 = self.context0(img0, flow_01)
             ctx1 = self.context1(img1, flow_10)
 
-            # RefineNet: residual correction on warped blend + multi-scale preds
+            # RefineNet: uses MERGED features from backbone + warped context
             residual, pred_list = self.refine(
-                feats, warped_blend, ctx0=ctx0, ctx1=ctx1
+                feats_merged, warped_blend, ctx0=ctx0, ctx1=ctx1
             )
 
-            # Pack flow info for loss: (B, 4, H, W) combined
             flow_combined = torch.cat([flow_01, flow_10], dim=1)
             return pred_list, flow_combined
         else:
             # Phase 1: Backbone only (no flow)
-            feats = self.backbone(img0, img1)
-
-            # Simple temporal average as warped blend (no flow available)
+            # Simple temporal average as warped blend
             warped_blend = 0.5 * (img0 + img1)
 
-            # RefineNet learns residual correction from this baseline
-            residual, pred_list = self.refine(feats, warped_blend)
+            # RefineNet learns residual correction from merged backbone features
+            residual, pred_list = self.refine(feats_merged, warped_blend)
 
             return pred_list, None
 
@@ -117,17 +114,19 @@ class ThesisModel(nn.Module):
         """
         Inference with Test Time Augmentation (TTA) support.
         """
-        # Scale handling for high-resolution
         if scale != 1.0:
             img0_s = F.interpolate(img0, scale_factor=scale, mode='bilinear', align_corners=False)
             img1_s = F.interpolate(img1, scale_factor=scale, mode='bilinear', align_corners=False)
         else:
             img0_s, img1_s = img0, img1
 
-        # Padding to ensure divisibility by 32
+        # Dynamic padding calculation based on window_size and downsampling
+        # Default divisor 32 works for window_size=8 and 2 levels of downsampling
         B, C, H, W = img0_s.shape
-        pad_h = (32 - H % 32) % 32
-        pad_w = (32 - W % 32) % 32
+        div = 32 # Minimum for current architecture
+        pad_h = (div - H % div) % div
+        pad_w = (div - W % div) % div
+        
         if pad_h != 0 or pad_w != 0:
             img0_s = F.pad(img0_s, (0, pad_w, 0, pad_h), mode='reflect')
             img1_s = F.pad(img1_s, (0, pad_w, 0, pad_h), mode='reflect')
