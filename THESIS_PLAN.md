@@ -11,11 +11,11 @@
 | **RIFE** | ECCV 2022 | Lightweight Flow, 快速但全域感知弱 |
 | **EMA-VFI** | CVPR 2023 | Inter-frame Attention, 運算開銷高 |
 | **VFIMamba** | NeurIPS 2024 | Pure SSM (Mamba1), 局部細節受限 |
-| **Ours (Thesis)** | -- | **Mamba2 NSS + Gated Window Attention + Feature Shunting** |
+| **Ours (Thesis)** | -- | **Mamba2 NSS + Gated Window Attention + Full-Channel Feature Synergy** |
 
 **核心創新點**：
 1. **Mamba2 (SSD) + NSS Scan**：使用 MaIR (CVPR 2025) 提出的 NSS 掃描，確保空間局部性。
-2. **Feature Shunting (Channel Split)**：將特徵分流至 SSM 與 Attention 兩路並行，兼顧全域與局部資訊。
+2. **Full-Channel Feature Synergy (Channel Split)**：讓 SSM 與 Attention 同時處理完整維度特徵，兼顧全域與局部資訊。
 3. **Spatial-aware CrossGating**：具備邊界感知的特徵融合機制。
 4. **Progressive Roadmap**：分階段解決特徵學習、運動對齊與 4K 適應問題。
 
@@ -29,8 +29,8 @@
 ### 2.2 NSS Scan (MaIR, CVPR 2025)
 Nested S-shaped Scan。透過條帶內 S 型走訪保持空間鄰近性，對於 VFI 的像素級對齊至關重要。
 
-### 2.3 Feature Shunting (NEW)
-針對高解析度場景，將隱向量通道拆分（例如 $F=64 \to 32+32$），分別由 Mamba2 負責結構、Attention 負責紋理，最後經由 CrossGating 融合。
+### 2.3 Full-Channel Feature Synergy (NEW)
+移除通道分流邏輯，讓 Mamba2 與 Attention 分支皆在完整通道下協作，最後經由 CrossGating 融合。
 
 ---
 

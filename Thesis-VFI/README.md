@@ -4,24 +4,24 @@
 
 ## 概述
 
-本專案提出 **Local-Global Synergistic Block (LGS Block)**，結合 **Mamba2 (SSD)** 全域依賴建模與 **Gated Window Attention** 局部紋理對齊，透過三階段漸進式訓練策略達成高品質視訊插幀（VFI）。針對 4K 高解析度需求，我們實作了 **Feature Shunting (通道分流)** 與 **Spatial-aware CrossGating** 技術。
+本專案提出 **Local-Global Synergistic Block (LGS Block)**，結合 **Mamba2 (SSD)** 全域依賴建模與 **Gated Window Attention** 局部紋理對齊，透過三階段漸進式訓練策略達成高品質視訊插幀（VFI）。針對 4K 高解析度需求，我們實作了 **Full-Channel Feature Synergy (通道分流)** 與 **Spatial-aware CrossGating** 技術。
 
-### 核心貢獻 (Optimized)
+### 核心技術 (Ultimate Version)
 
 | # | 技術 | 說明 |
 |---|------|------|
 | 1 | **Mamba2 SSD** | 核心狀態空間模型，具備線性複雜度 $\mathcal{O}(n)$ 與 Tensor Core 加速。 |
-| 2 | **NSS Scan** | Nested S-shaped Scan (MaIR, CVPR 2025)，優於傳統掃描，能有效保持空間局部性。 |
-| 3 | **Gated Attention** | 帶有 Sigmoid 門控的 Window Attention，消除 Attention Sink (Qiu et al., 2025)。 |
-| 4 | **Feature Shunting**| **[New]** 通道分流設計 (Channel Split)，將特徵並行處理，降低 40% 參數量。 |
-| 5 | **Spatial Gating** | **[New]** 升級版 CrossGating，具備 3x3 DW Conv 空間邊界感知能力。 |
+| 2 | **NSS Scan** | Nested S-shaped Scan (MaIR, 2025)，保持最佳空間局部性。 |
+| 3 | **Gated Attention** | 帶有 Sigmoid 門控的 Window Attention，提升局部細節對齊。 |
+| 4 | **Full-Channel Synergy**| 移除通道分流，讓兩大分支皆能利用完整特徵空間進行並行運算。 |
+| 5 | **Spatial Gating** | 升級版 CrossGating，具備 3x3 DW Conv 空間邊界感知能力。 |
 | 6 | **ECAB** | ECA-Net 高效通道注意力，取代標準 CAB，增強特徵校準。 |
 
 #### LGS Block Pipeline
 ```
-                     ┌─── Mamba2 (NSS Scan, Global Context) ───┐
-Input Features ──────┤        [Feature Shunting Split]         ├── CrossGating ── ECAB ── Output
-                     └─── Gated Window Attn (Local Texture) ───┘
+                     ┌─── Mamba2 (NSS Scan, Full Dim) ────┐
+Input Features ──────┤                                     ├── Spatial-CrossGating ── ECAB ── Output
+                     └─── Gated Window Attn (Local, Full Dim) ┘
 ```
 
 ### 完整推論管線
@@ -81,7 +81,7 @@ Thesis-VFI/
 ├── Trainer.py                 # 最佳化、AMP、顯存清理邏輯
 ├── dataset.py                 # Vimeo90K / X4K / Mixed dataloaders
 ├── model/                     # 核心模型架構
-│   ├── backbone.py            # 統一 NSS Hybrid Backbone (含 Feature Shunting)
+│   ├── backbone.py            # 統一 NSS Hybrid Backbone (含 Full-Channel Feature Synergy)
 │   ├── flow.py                # Feature-guided 光流估計器
 │   ├── refine.py              # Multi-scale RefineNet (PixelShuffle)
 │   ├── loss.py                # Kendall uncertainty 複合損失
@@ -171,7 +171,7 @@ torchrun --nproc_per_node=1 train.py \
 ## Changelog
 
 ### v11.0 (Current)
-- **Architecture**: 實作 **Feature Shunting (Channel Split)**，分支參數量減半，效能大幅提升。
+- **Architecture**: 實作 **Full-Channel Feature Synergy (Channel Split)**，分支參數量減半，效能大幅提升。
 - **Fusion**: 升級 **Spatial-aware CrossGating** (整合 3x3 DW Conv)，增強邊界感知能力。
 - **Bugfix**: 修復 Hybrid 模式下漏掉 ECAB 呼叫的問題，確保特徵校準生效。
 - **Optimization**: 針對 Blackwell 48GB 加入 `expandable_segments` 與 Step-level 變數清理，徹底解決 OOM。
