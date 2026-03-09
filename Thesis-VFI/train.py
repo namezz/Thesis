@@ -28,31 +28,27 @@ def get_learning_rate(step, step_per_epoch, total_epochs=300, base_lr=2e-4, min_
 
 from tqdm import tqdm
 
-def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(2, 1), freeze_epochs=0, total_epochs=300, curriculum=False, curriculum_T=50, crop_size=256, lr=2e-4, num_workers=8, grad_accum=1, eval_interval=10):
+def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(2, 1), freeze_epochs=0, total_epochs=300, curriculum=False, curriculum_T=50, crop_size=256, lr=2e-4, num_workers=8, grad_accum=1, eval_interval=10, train_state=None):
     logname = project_config.MODEL_CONFIG["LOGNAME"]
     if local_rank == 0:
         writer = SummaryWriter(f'log/train_{logname}')
         writer_val = SummaryWriter(f'log/validate_{logname}')
     else:
-        writer = None
-        writer_val = None
+        writer = writer_val = None
+    
+    # Initialize state from train_state or scratch
     step = 0
     nr_eval = 0
     best_psnr_holder = {'val': 0.0}
     start_epoch = 0
     
-    # Resume training state from checkpoint if available
-    optim_path = f'ckpt/{logname}_optim.pkl'
-    if os.path.exists(optim_path):
-        optim_ckpt = torch.load(optim_path, map_location='cpu', weights_only=False)
-        train_state = optim_ckpt.get('train_state', None)
-        if train_state is not None:
-            start_epoch = train_state.get('epoch', 0) + 1
-            step = train_state.get('step', 0)
-            nr_eval = train_state.get('nr_eval', 0)
-            best_psnr_holder['val'] = train_state.get('best_psnr', 0.0)
-            if local_rank == 0:
-                print(f"Resuming from epoch {start_epoch}, step {step}, best_psnr {best_psnr_holder['val']:.4f}")
+    if train_state is not None:
+        start_epoch = train_state.get('epoch', 0) + 1
+        step = train_state.get('step', 0)
+        nr_eval = train_state.get('nr_eval', 0)
+        best_psnr_holder['val'] = train_state.get('best_psnr', 0.0)
+        if local_rank == 0:
+            print(f"★ Resuming from epoch {start_epoch}, step {step}, best_psnr {best_psnr_holder['val']:.4f}")
     
     # Freeze backbone if requested
     if freeze_epochs > 0:
@@ -210,14 +206,16 @@ if __name__ == "__main__":
     model = Model(local_rank, backbone_lr_scale=args.backbone_lr_scale)
     
     # Auto-resume logic
+    train_state = None
     if os.path.exists(f'ckpt/{project_config.MODEL_CONFIG["LOGNAME"]}.pkl'):
-        model.load_model(name=project_config.MODEL_CONFIG["LOGNAME"])
+        train_state = model.load_model(name=project_config.MODEL_CONFIG["LOGNAME"])
     elif args.resume:
-        model.load_model(name=args.resume.replace('.pkl', ''))
+        train_state = model.load_model(name=args.resume.replace('.pkl', ''))
     
     train(model, local_rank, args.batch_size, args.data_path, args.x4k_path, 
           mixed_ratio=(v_w, x_w), freeze_epochs=args.freeze_backbone, 
           total_epochs=(1 if args.dry_run else args.epochs),
           curriculum=args.curriculum, curriculum_T=args.curriculum_T,
           crop_size=args.crop_size, lr=args.lr, num_workers=args.num_workers,
-          grad_accum=args.grad_accum, eval_interval=args.eval_interval)
+          grad_accum=args.grad_accum, eval_interval=args.eval_interval,
+          train_state=train_state)

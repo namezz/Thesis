@@ -55,55 +55,38 @@ class Model:
         self.net.to(dev)
         if hasattr(self, 'loss_fn'): self.loss_fn.to(dev)
 
-    def load_model(self, name=None, rank=0):
-        if rank <= 0 :
-            if name is None:
-                name = self.name
-            path = f'ckpt/{name}.pkl'
-            if os.path.exists(path):
-                print(f"Loading model from {path}")
-                state_dict = torch.load(path, map_location='cpu', weights_only=False)
-                # Handle DDP 'module.' prefix mismatch
-                model_dict = self.net.state_dict()
-                has_module = any(k.startswith('module.') for k in model_dict.keys())
-                ckpt_has_module = any(k.startswith('module.') for k in state_dict.keys())
-                if has_module and not ckpt_has_module:
-                    state_dict = {f'module.{k}': v for k, v in state_dict.items()}
-                elif not has_module and ckpt_has_module:
-                    state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
-                # Shape-safe loading: skip keys with mismatched shapes
-                # (handles Phase 1→2 transition where RefineNet channels change)
-                compatible = {}
-                skipped = []
-                for k, v in state_dict.items():
-                    if k in model_dict and model_dict[k].shape == v.shape:
-                        compatible[k] = v
-                    else:
-                        skipped.append(k)
-                missing = set(model_dict.keys()) - set(compatible.keys())
-                self.net.load_state_dict(compatible, strict=False)
-                if skipped:
-                    print(f"  Skipped {len(skipped)} keys (shape mismatch): {skipped[:5]}{'...' if len(skipped)>5 else ''}")
-                if missing:
-                    new_modules = set(k.split('.')[0] if not k.startswith('module.') else k.split('.')[1] for k in missing)
-                    print(f"  New modules (random init): {new_modules}")
-                # Load optimizer state if available (skip if param groups changed)
-                optim_path = f'ckpt/{name}_optim.pkl'
-                if os.path.exists(optim_path):
-                    optim_state = torch.load(optim_path, map_location='cpu', weights_only=False)
-                    try:
-                        if 'optimizer' in optim_state:
-                            self.optimG.load_state_dict(optim_state['optimizer'])
-                        if 'scaler' in optim_state and self.scaler is not None:
-                            self.scaler.load_state_dict(optim_state['scaler'])
-                        print(f"  Loaded optimizer state from {optim_path}")
-                    except (ValueError, RuntimeError) as e:
-                        print(f"  Skipped optimizer state (param groups changed): {e}")
-                        optim_state.pop('optimizer', None)
-                        optim_state.pop('scaler', None)
-                    return optim_state.get('train_state', None)
-            else:
-                print(f"No checkpoint found at {path}, starting from scratch.")
+    def load_model(self, name=None):
+        if name is None:
+            name = self.name
+        path = f'ckpt/{name}.pkl'
+        if os.path.exists(path):
+            print(f"Loading model from {path}")
+            state_dict = torch.load(path, map_location='cpu', weights_only=False)
+            model_dict = self.net.state_dict()
+            
+            # Handle DDP prefix and shape matching
+            compatible = {}
+            for k, v in state_dict.items():
+                fixed_k = k.replace('module.', '', 1) if not any(rk.startswith('module.') for rk in model_dict.keys()) else (f'module.{k}' if not k.startswith('module.') else k)
+                if fixed_k in model_dict and model_dict[fixed_k].shape == v.shape:
+                    compatible[fixed_k] = v
+            
+            self.net.load_state_dict(compatible, strict=False)
+            
+            # Load optimizer state
+            optim_path = f'ckpt/{name}_optim.pkl'
+            if os.path.exists(optim_path):
+                optim_state = torch.load(optim_path, map_location='cpu', weights_only=False)
+                try:
+                    if 'optimizer' in optim_state:
+                        self.optimG.load_state_dict(optim_state['optimizer'])
+                    print(f"  Loaded optimizer state from {optim_path}")
+                except Exception as e:
+                    print(f"  Warning: Could not load optimizer state: {e}")
+                
+                return optim_state.get('train_state', None)
+        else:
+            print(f"No checkpoint found at {path}")
         return None
     
     def save_model(self, rank=0, suffix='', train_state=None):
