@@ -180,34 +180,35 @@ class FactorizedSSMBlock(nn.Module):
 class LGSBlock(nn.Module):
     """
     Local-Global Synergistic Block.
-    Upgraded with Channel Split (Feature Shunting) for extreme efficiency.
+    Ultimate Version: Full-Channel Synergy (No Splitting).
     """
     def __init__(self, dim, num_heads, window_size=8, shift_size=0, mlp_ratio=4., drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, mamba_d_state=64, mamba_d_conv=4, mamba_expand=2, mamba_headdim=64, num_scan_dirs=4, stripe_width=4, backbone_mode='hybrid', use_ecab=True, use_checkpointing=True):
         super().__init__()
         self.dim, self.backbone_mode, self.norm1 = dim, backbone_mode, norm_layer(dim)
         
-        # Channel Split logic: half to Mamba, half to Attention
-        self.half_dim = dim // 2 if backbone_mode == 'hybrid' else dim
-        
-        # Mamba2 requires d_ssm (half_dim * expand) to be divisible by headdim.
-        # Standard expand=2, so d_ssm = dim. 
-        # For Ultra (dim=64, half=32), d_ssm=64. headdim=64 is fine.
-        # But if headdim > d_ssm, it will fail.
-        actual_headdim = min(mamba_headdim, self.half_dim * mamba_expand)
+        # Mamba2 requires d_ssm (dim * expand) to be divisible by headdim.
+        # We force headdim to be 16 or 32 which are common divisors for F=32, 48, 64.
+        d_ssm = dim * mamba_expand
+        if d_ssm % 64 == 0:
+            actual_headdim = 64
+        elif d_ssm % 32 == 0:
+            actual_headdim = 32
+        else:
+            actual_headdim = 16
         
         self.use_mamba = backbone_mode in ['hybrid', 'mamba2_only']
         if self.use_mamba:
-            self.factorized_ssm = FactorizedSSMBlock(self.half_dim, mamba_d_state, mamba_d_conv, mamba_expand, num_scan_dirs, stripe_width, shift_size > 0, use_checkpointing, actual_headdim)
+            self.factorized_ssm = FactorizedSSMBlock(dim, mamba_d_state, mamba_d_conv, mamba_expand, num_scan_dirs, stripe_width, shift_size > 0, use_checkpointing, actual_headdim)
         
         self.use_attn = backbone_mode in ['hybrid', 'gated_attn_only']
         self.window_size, self.shift_size = window_size, shift_size
         if self.use_attn:
-            self.attn = GatedWindowAttention(self.half_dim, window_size, num_heads, True, None, attn_drop, drop)
+            self.attn = GatedWindowAttention(dim, window_size, num_heads, True, None, attn_drop, drop)
         
         # Fusion and Post-processing
         if backbone_mode == 'hybrid':
-            # CrossGating now directly projects to the full dimension
-            self.cross_gate = CrossGatingFusion(self.half_dim, d_out=dim)
+            # Both branches are full dim
+            self.cross_gate = CrossGatingFusion(dim, d_out=dim)
         
         self.cab = ECAB(dim) if use_ecab else nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dim, dim // 4, 1), nn.ReLU(True), nn.Conv2d(dim // 4, dim, 1), nn.Sigmoid())
         self.use_ecab = use_ecab
@@ -223,16 +224,14 @@ class LGSBlock(nn.Module):
         B, shortcut, x_norm = twoB // 2, x, self.norm1(x)
         
         if self.backbone_mode == 'hybrid':
-            # === Feature Shunting (Channel Split) ===
-            x_mamba_in = x_norm[..., :self.half_dim]
-            x_attn_in = x_norm[..., self.half_dim:]
+            # === Full-Channel Branching ===
             
-            # Mamba Branch
-            f0_m, f1_m = self.factorized_ssm(x_mamba_in[:B], x_mamba_in[B:], H, W)
-            xm = torch.cat([f0_m, f1_m], dim=0) # [2B, L, C/2]
+            # Mamba Branch (Full Channel)
+            f0_m, f1_m = self.factorized_ssm(x_norm[:B], x_norm[B:], H, W)
+            xm = torch.cat([f0_m, f1_m], dim=0) # [2B, L, C]
             
-            # Attention Branch
-            xa_2d = x_attn_in.view(twoB, H, W, self.half_dim)
+            # Attention Branch (Full Channel)
+            xa_2d = x_norm.view(twoB, H, W, C)
             if self.shift_size > 0:
                 img_mask = torch.zeros((1, H, W, 1), device=x.device)
                 h_s = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
@@ -246,30 +245,29 @@ class LGSBlock(nn.Module):
                 a_m = (m_w.unsqueeze(1) - m_w.unsqueeze(2)).masked_fill(m_w.unsqueeze(1)-m_w.unsqueeze(2) != 0, -100.0).masked_fill(m_w.unsqueeze(1)-m_w.unsqueeze(2) == 0, 0.0)
                 s_x = torch.roll(xa_2d, (-self.shift_size, -self.shift_size), (1, 2))
             else: s_x, a_m = xa_2d, None
-            w_x = window_partition(s_x, self.window_size).view(-1, self.window_size**2, self.half_dim)
-            a_w = self.attn(w_x, a_m).view(-1, self.window_size, self.window_size, self.half_dim)
+            w_x = window_partition(s_x, self.window_size).view(-1, self.window_size**2, C)
+            a_w = self.attn(w_x, a_m).view(-1, self.window_size, self.window_size, C)
             r_x = window_reverse(a_w, self.window_size, H, W)
-            xa = torch.roll(r_x, (self.shift_size, self.shift_size), (1, 2)).view(twoB, L, self.half_dim) if self.shift_size > 0 else r_x.view(twoB, L, self.half_dim)
+            xa = torch.roll(r_x, (self.shift_size, self.shift_size), (1, 2)).view(twoB, L, C) if self.shift_size > 0 else r_x.view(twoB, L, C)
             
             # Fusion
-            fm_2d = xm.transpose(1, 2).view(twoB, self.half_dim, H, W)
-            fa_2d = xa.transpose(1, 2).view(twoB, self.half_dim, H, W)
-            x_fused = self.cross_gate(fm_2d, fa_2d) # [2B, C, H, W] - Already full dim
+            fm_2d = xm.transpose(1, 2).view(twoB, C, H, W)
+            fa_2d = xa.transpose(1, 2).view(twoB, C, H, W)
+            x_fused = self.cross_gate(fm_2d, fa_2d) # [2B, C, H, W]
             
-            # APPLY ECAB (Fixing the bug!)
+            # APPLY ECAB
             x_fused = self._apply_cab(x_fused)
             
             x_fused = x_fused.flatten(2).transpose(1, 2)
             x = shortcut + self.drop_path(x_fused)
             
         else:
-            # Single branch modes (No splitting)
+            # Single branch modes (Maintain C)
             if self.use_mamba:
                 f0_m, f1_m = self.factorized_ssm(x_norm[:B], x_norm[B:], H, W)
                 x_f = torch.cat([f0_m, f1_m], dim=0)
             else:
                 x_2d = x_norm.view(twoB, H, W, C)
-                # ... [Keep original attention logic for single branch] ...
                 if self.shift_size > 0:
                     img_mask = torch.zeros((1, H, W, 1), device=x.device)
                     h_s = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
@@ -317,7 +315,7 @@ class HybridBackbone(nn.Module):
         x = self.patch_embed(torch.cat([img0, img1], 0))
         
         outs_merged = []
-        outs_per_frame = [] # To store (f0, f1) pairs for flow estimation
+        outs_per_frame = [] 
         
         twoB, _, H, W = x.shape
         x = x.flatten(2).transpose(1, 2)
@@ -326,15 +324,11 @@ class HybridBackbone(nn.Module):
             x, H, W = l(x, H, W)
             x_out = x.transpose(1, 2).view(twoB, -1, H, W)
             
-            # Extract per-frame features (view, no memory copy)
             x_f0 = x_out[:B_orig]
             x_f1 = x_out[B_orig:]
             
-            # Path 1: Merged features for RefineNet
             x_merged = self.merge_convs[i](torch.cat([x_f0, x_f1], 1))
             outs_merged.append(x_merged)
-            
-            # Path 2: Per-frame pairs for Flow Estimator
             outs_per_frame.append((x_f0, x_f1))
             
             if i < self.num_layers - 1:
