@@ -19,7 +19,7 @@
 
 ```
                      ┌─── Mamba2 (NSS Scan, Global Context) ───┐
-Input Features ──────┤        [Full-Channel Synergy]           ├── CrossGating ── ECAB ── Output
+Input Features ──────┤        [Full-Channel Synergy]           ├── Spatial-CrossGating ── ECAB ── Output
                      └─── Gated Window Attn (Local Texture) ───┘
 ```
 
