@@ -4,31 +4,32 @@
 
 ## 概述
 
-本專案提出 **Local-Global Synergistic Block (LGS Block)**，結合 **Mamba2 (SSD)** 全域依賴建模與 **Gated Window Attention** 局部紋理對齊，透過三階段漸進式訓練策略達成高品質視訊插幀（VFI）。針對 4K 高解析度需求，我們實作了 **Full-Channel Feature Synergy (通道分流)** 與 **Spatial-aware CrossGating** 技術。
+本專案提出 **Local-Global Synergistic Block (LGS Block)**，結合 **Mamba2 (SSD)** 全域依賴建模與 **Gated Window Attention** 局部紋理對齊，透過三階段漸進式訓練策略達成高品質視訊插幀（VFI）。針對 4K 高解析度需求，我們實作了 **Full-Channel Feature Synergy** 與 **Spatial-aware CrossGating** 技術。
 
-### 核心技術 (Ultimate Version)
+### 核心貢獻
 
 | # | 技術 | 說明 |
 |---|------|------|
 | 1 | **Mamba2 SSD** | 核心狀態空間模型，具備線性複雜度 $\mathcal{O}(n)$ 與 Tensor Core 加速。 |
-| 2 | **NSS Scan** | Nested S-shaped Scan (MaIR, 2025)，保持最佳空間局部性。 |
-| 3 | **Gated Attention** | 帶有 Sigmoid 門控的 Window Attention，提升局部細節對齊。 |
-| 4 | **Full-Channel Synergy**| 移除通道分流，讓兩大分支皆能利用完整特徵空間進行並行運算。 |
+| 2 | **NSS Scan** | Nested S-shaped Scan (MaIR, 2025)，有效保持空間局部性，優於全圖 Snake Scan。 |
+| 3 | **Gated Attention** | NeurIPS 2025 Best Paper 思路 — Sigmoid Gate 消除 Attention Sink。 |
+| 4 | **Full-Channel Synergy**| 移除通道分流邏輯，讓 Mamba2 與 Attention 分支均在完整通道下協作。 |
 | 5 | **Spatial Gating** | 升級版 CrossGating，具備 3x3 DW Conv 空間邊界感知能力。 |
 | 6 | **ECAB** | ECA-Net 高效通道注意力，取代標準 CAB，增強特徵校準。 |
 
-#### LGS Block Pipeline
 ```
-                     ┌─── Mamba2 (NSS Scan, Full Dim) ────┐
-Input Features ──────┤                                     ├── Spatial-CrossGating ── ECAB ── Output
-                     └─── Gated Window Attn (Local, Full Dim) ┘
+                     ┌─── Mamba2 (NSS Scan, Global Context) ───┐
+Input Features ──────┤        [Full-Channel Synergy]           ├── CrossGating ── ECAB ── Output
+                     └─── Gated Window Attn (Local Texture) ───┘
 ```
 
 ### 完整推論管線
+
 ```
 img0, img1
     │
     ├─── Backbone (LGS Block × 3 scales) ──→ feats [s0, s1, s2]
+    │        (Outputs both merged features and per-frame pairs)
     │
     ├─── FlowEstimator (feature-guided, coarse→fine) ──→ flow_01, flow_10, mask
     │
@@ -43,20 +44,21 @@ img0, img1
 
 ---
 
-## 研究階段 (Progressive Phases)
+## 研究階段
 
 ### Phase 1：Backbone 預訓練
 - **目標**：驗證 Mamba2 + Gated Attention 混合架構在 Vimeo90K 的特徵表徵能力。
-- **架構**：Backbone + RefineNet（無光流，`blend = 0.5 × (img0 + img1)`）。
+- **架構**：Backbone + RefineNet（無光流，`warped_blend = 0.5 × (img0 + img1)`）。
 - **目標指標**：Vimeo90K PSNR ≥ 35.0 dB。
 
 ### Phase 2：光流引導
-- **目標**：引入顯式光流估計以解決大位移運動問題。
+- **目標**：透過顯式光流估計解決大幅度運動問題。
+- **架構**：Backbone → Flow → Warp → Context → RefineNet。
 - **新增模組**：FlowEstimator (6.82M) + ContextNet (0.57M)。
 - **目標指標**：SNU-FILM Hard ≥ 30.0 dB。
 
 ### Phase 3：4K 高保真合成
-- **目標**：4K 紋理保持與多尺度適應。
+- **目標**：4K 紋理保存與多尺度適應。
 - **策略**：Vimeo90K + X4K1000FPS 混合訓練（Sigmoid Curriculum）。
 - **Crop Size**：漸進式 256 → 384 → 512。
 
@@ -64,7 +66,9 @@ img0, img1
 
 ## 模型變體 (Variants)
 
-| 變體 | F (Base Dim) | Depth | Backbone Params | Phase 1 Total |
+使用 `--variant` 參數選擇：
+
+| 變體 | F | Depth | Backbone Params | Phase 1 Total |
 |------|---|-------|----------|---------|
 | **base** | 32 | [2,2,2] | ~0.8M | ~1.5M |
 | **hp** | 48 | [3,3,3] | ~2.5M | ~4.2M |
@@ -76,16 +80,21 @@ img0, img1
 
 ```
 Thesis-VFI/
-├── config.py                  # 統一模型配置 (base, hp, ultra)
-├── train.py                   # 訓練腳本 (支援 dry_run, variant 選擇)
-├── Trainer.py                 # 最佳化、AMP、顯存清理邏輯
+├── config.py                  # 模型配置 & 階段切換 (base, hp, ultra)
+├── train.py                   # 訓練腳本 (含 dry_run, Step-level 清理)
+├── Trainer.py                 # 最佳化、AMP、顯存清理邏輯、Checkpoint I/O
 ├── dataset.py                 # Vimeo90K / X4K / Mixed dataloaders
+├── demo_2x.py                # 2× 插幀 demo
+│
 ├── model/                     # 核心模型架構
-│   ├── backbone.py            # 統一 NSS Hybrid Backbone (含 Full-Channel Feature Synergy)
-│   ├── flow.py                # Feature-guided 光流估計器
-│   ├── refine.py              # Multi-scale RefineNet (PixelShuffle)
+│   ├── __init__.py            # ThesisModel 整合 (Phase 1/2 forward)
+│   ├── backbone.py            # 統一 NSS Hybrid Backbone (LGS Block)
+│   ├── flow.py                # Feature-guided 光流估計器 (Per-frame matched)
+│   ├── refine.py              # Multi-scale RefineNet (PixelShuffle + Tanh)
+│   ├── warplayer.py           # BackWarp 可微分反向 warp
 │   ├── loss.py                # Kendall uncertainty 複合損失
 │   └── utils.py               # 空間感知 CrossGating, ECAB, NSS 索引
+│
 ├── benchmark/                 # 評估腳本 (Vimeo90K, UCF101, SNU-FILM, XTest)
 ├── ckpt/                      # 模型權重儲存 (.pkl)
 └── log/                       # TensorBoard 日誌
@@ -93,11 +102,12 @@ Thesis-VFI/
 
 ---
 
-## 環境與安裝
+## 環境設定
 
+### 已驗證環境
 - **GPU**: NVIDIA RTX 5000 Blackwell (48GB GDDR7, sm_120)
-- **CUDA**: 12.8 | **PyTorch**: ≥ 2.8
-- **核心依賴**: `mamba-ssm`, `causal-conv1d` (須針對 sm_120 編譯)
+- **CUDA Toolkit**: 12.8
+- **PyTorch**: ≥ 2.8 (RTX 5000 sm_120 必備)
 
 ### 安裝步驟
 
@@ -134,16 +144,18 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
 
 ---
 
-## 訓練指令 (Quick Start)
+## 訓練指令
 
-### 通用參數
-- `--phase`: 訓練階段 (1, 2, or 3)
-- `--variant`: 模型變體 (base, hp, or ultra)
-- `--grad_accum`: 梯度累積步數 (Blackwell 建議 2)
+### 通用參數說明
+- `--phase`: 1, 2, or 3
+- `--variant`: base, hp, or ultra
+- `--grad_accum`: 梯度累積步數 (Blackwell 建議 2 以上)
+- `--exp_name`: 實驗名稱 (對應 ckpt/log 檔名)
 
-### 執行範例 (RTX 5000 48GB Optimized)
+### 快速啟動範例 (RTX 5000 48GB Optimized)
+
+**Phase 1：Backbone 預訓練 (Ultra)**
 ```bash
-# Phase 1 Ultra 預訓練
 nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
 torchrun --nproc_per_node=1 train.py \
     --phase 1 --variant ultra \
@@ -153,28 +165,26 @@ torchrun --nproc_per_node=1 train.py \
     --exp_name phase1_ultra_final > train_p1.log 2>&1 &
 ```
 
----
-
-## 損失函數設計
-
-使用 **Kendall uncertainty weighting** 自適應權重平衡：
-
-| 損失 | 說明 | Phase 1 | Phase 2+ |
-|------|------|:-------:|:-------:|
-| **LapLoss** | 多尺度 Laplacian Pyramid + Charbonnier | ✓ | ✓ |
-| **Ternary** | Per-channel 結構相似度 (Census) | ✓ | ✓ |
-| **FlowSmooth** | 空間邊界感知光流平滑 | — | ✓ |
-| **FFT Loss** | 頻域 L1 損失，提升高頻細節 | — | ✓ |
+**Phase 2：光流引導**
+```bash
+nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
+torchrun --nproc_per_node=1 train.py \
+    --phase 2 --variant ultra \
+    --resume phase1_ultra_final_best \
+    --freeze_backbone 50 --backbone_lr_scale 0.1 \
+    --data_path /josh/dataset/vimeo90k/vimeo_triplet \
+    --exp_name phase2_ultra_flow > train_p2.log 2>&1 &
+```
 
 ---
 
 ## Changelog
 
 ### v11.0 (Current)
-- **Architecture**: 實作 **Full-Channel Feature Synergy (Channel Split)**，分支參數量減半，效能大幅提升。
+- **Architecture**: 實作 **Full-Channel Feature Synergy**，最大化特徵表徵能力。
 - **Fusion**: 升級 **Spatial-aware CrossGating** (整合 3x3 DW Conv)，增強邊界感知能力。
-- **Bugfix**: 修復 Hybrid 模式下漏掉 ECAB 呼叫的問題，確保特徵校準生效。
 - **Optimization**: 針對 Blackwell 48GB 加入 `expandable_segments` 與 Step-level 變數清理，徹底解決 OOM。
+- **Interface**: Backbone 新增 `outs_per_frame` 接口，支援光流模組在特徵空間進行精確 Matching。
 
 ### v10.0
 - **loss.py** 全面重構：6 項修正 + 2 項新增（FFT Loss、Occlusion-aware Flow Smoothness）
@@ -182,7 +192,7 @@ torchrun --nproc_per_node=1 train.py \
 - **refine.py** 全面重構：PixelShuffle + Channel Attention + residual-on-warped + multi-scale output
 - **warplayer.py** 重構：BackWarp nn.Module + instance-level grid cache
 - **utils.py** 清理：移除 dead code（interleaved scan），加入 section headers
-- **\_\_init\_\_.py** 更新：整合新 flow/refine 介面，支援 pred_list multi-scale output
+- **__init__.py** 更新：整合新 flow/refine 介面，支援 pred_list multi-scale output
 - **Trainer.py** 更新：支援 multi-scale pred、occlusion-aware loss、discriminative LR
 
 ### v9.2

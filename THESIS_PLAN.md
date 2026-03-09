@@ -14,10 +14,11 @@
 | **Ours (Thesis)** | -- | **Mamba2 NSS + Gated Window Attention + Full-Channel Feature Synergy** |
 
 **核心創新點**：
-1. **Mamba2 (SSD) + NSS Scan**：使用 MaIR (CVPR 2025) 提出的 NSS 掃描，確保空間局部性。
-2. **Full-Channel Feature Synergy (Channel Split)**：讓 SSM 與 Attention 同時處理完整維度特徵，兼顧全域與局部資訊。
-3. **Spatial-aware CrossGating**：具備邊界感知的特徵融合機制。
-4. **Progressive Roadmap**：分階段解決特徵學習、運動對齊與 4K 適應問題。
+1. **Mamba2 (SSD) + NSS Scan**：利用 MaIR (CVPR 2025) 提出的 NSS 掃描保持空間局部性，結合 Mamba2 的線性複雜度處理全域資訊。
+2. **Full-Channel Feature Synergy**：採用全通道並行支路設計，讓 Mamba2 負責的全域結構與 Gated Attention 負責的局部紋理在完整通道下協作，最大化特徵表徵能力。
+3. **Spatial-aware CrossGating**：整合 3x3 Depthwise 卷積，使門控機制能夠感知相鄰像素的邊界，優化遮擋區域的插補品質。
+4. **Per-frame Feature Guidance**：Backbone 同時輸出融合特徵與原始幀特徵對，使光流估計器能在特徵空間執行精確的雙幀 Matching 與 Warping。
+5. **Uncertainty-based Adaptive Loss**：自動平衡 LapLoss、Ternary、與 FlowSmoothness 損失權重。
 
 ---
 
