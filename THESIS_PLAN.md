@@ -13,12 +13,13 @@
 | **VFIMamba** | NeurIPS 2024 | Pure SSM (Mamba1), 局部細節受限 |
 | **Ours (Thesis)** | -- | **Mamba2 NSS + Gated Window Attention + Full-Channel Feature Synergy** |
 
-**核心創新點**：
-1. **Mamba2 (SSD) + NSS Scan**：利用 MaIR (CVPR 2025) 提出的 NSS 掃描保持空間局部性，結合 Mamba2 的線性複雜度處理全域資訊。
-2. **Full-Channel Feature Synergy**：採用全通道並行支路設計，讓 Mamba2 負責的全域結構與 Gated Attention 負責的局部紋理在完整通道下協作，最大化特徵表徵能力。
-3. **Spatial-aware CrossGating**：整合 3x3 Depthwise 卷積，使門控機制能夠感知相鄰像素的邊界，優化遮擋區域的插補品質。
-4. **Per-frame Feature Guidance**：Backbone 同時輸出融合特徵與原始幀特徵對，使光流估計器能在特徵空間執行精確的雙幀 Matching 與 Warping。
-5. **Uncertainty-based Adaptive Loss**：自動平衡 LapLoss、Ternary、與 FlowSmoothness 損失權重。
+**核心技術創新 (Implementation-based)**
+
+1. **Mamba2 (SSD) + NSS Scan**：利用 NSS 掃描保持空間局部性，結合 Mamba2 的線性複雜度處理全域資訊。
+2. **Full-Channel Feature Synergy**：讓 Mamba2 與 Gated Attention 在完整通道下並行協作，最大化特徵表徵能力。
+3. **Dual-Path Feature Flow**：Backbone 具備雙重輸出能力，同時產出融合特徵（Path A）供重建，以及獨立特徵對（Path B）供光流模組執行精確的 Feature-level Matching。
+4. **Spatial-aware CrossGating**：在門控路徑中實作 3x3 DW Conv，使特徵融合具備邊界感知能力，顯著優化遮擋區域細節。
+5. **Progressive Roadmap**：分階段解決特徵學習、運動對齊與 4K 適應問題。
 
 ---
 

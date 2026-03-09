@@ -23,23 +23,26 @@ Input Features ──────┤        [Full-Channel Synergy]           ├
                      └─── Gated Window Attn (Local Texture) ───┘
 ```
 
-### 完整推論管線
+### 完整推論管線 (Implementation Flow)
 
 ```
 img0, img1
     │
-    ├─── Backbone (LGS Block × 3 scales) ──→ feats [s0, s1, s2]
-    │        (Outputs both merged features and per-frame pairs)
-    │
-    ├─── FlowEstimator (feature-guided, coarse→fine) ──→ flow_01, flow_10, mask
-    │
-    ├─── BackWarp (differentiable) ──→ warped_img0, warped_img1
-    │        mask × warped_img0 + (1-mask) × warped_img1 = warped_blend
-    │
-    ├─── ContextNet (per-frame multi-scale features, warped by flow)
-    │
-    └─── RefineNet (U-Net decoder, PixelShuffle, Channel Attention)
-              warped_blend + residual → pred (multi-scale outputs)
+    ├─── Backbone (LGS Block × 3 scales)
+    │        ├── Path A: outs_merged (Fused features for semantic decoding) ────┐
+    │        └── Path B: outs_per_frame (Independent pairs for matching) ──┐    │
+    │                                                                      │    │
+    ├─── FlowEstimator (Feature-level Matching using Path B) <─────────────┘    │
+    │        └──→ flow_01, flow_10, blend_mask                                  │
+    │                                                                           │
+    ├─── BackWarp (Differentiable Warping)                                      │
+    │        └──→ warped_img0, warped_img1                                      │
+    │             (mask-blended to create warped_baseline)                      │
+    │                                                                           │
+    ├─── ContextNet (CNN features warped by flow) ─────────────────────────┐    │
+    │                                                                      │    │
+    └─── RefineNet (Multi-scale residual correction) <─────────────────────┴────┘
+              warped_baseline + residual (Tanh) → final pred
 ```
 
 ---
