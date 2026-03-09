@@ -184,6 +184,7 @@ torchrun --nproc_per_node=1 train.py \
 ## Changelog
 
 ### v11.0 (Current)
+- **Critical Fix**: 修正了 `Trainer.py` 靜態導入 `MODEL_CONFIG` 導致 `--variant` 參數失效的 Bug。現在配置會由 `train.py` 顯式傳入，確保 `ultra (F=64)` 等變體能正確建立。
 - **Architecture**: 實作 **Full-Channel Feature Synergy**，最大化特徵表徵能力。
 - **Fusion**: 升級 **Spatial-aware CrossGating** (整合 3x3 DW Conv)，增強邊界感知能力。
 - **Optimization**: 針對 Blackwell 48GB 加入 `expandable_segments` 與 Step-level 變數清理，徹底解決 OOM。

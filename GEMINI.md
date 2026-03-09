@@ -21,9 +21,9 @@
 
 ## 常用工作流 (Workflows)
 
-### 啟動主實驗 (Ultra 48GB Optimized)
+### 啟動與驗證 (Startup & Verification)
+1. **啟動 Ultra 訓練**:
 ```bash
-# 註：全通道版 Ultra 建議先嘗試 Batch 8，若顯存不足請調至 6
 nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
 torchrun --nproc_per_node=1 train.py \
     --phase 1 --variant ultra \
@@ -32,6 +32,11 @@ torchrun --nproc_per_node=1 train.py \
     --num_workers 12 \
     --exp_name phase1_ultra_final > train_p1.log 2>&1 &
 ```
+
+2. **核心驗證 (防止跑錯變體)**:
+   - 啟動後等待產生第一個 Checkpoint (約一個 Epoch)。
+   - 執行 `python inspect_ckpt.py`。
+   - **必須確認** 輸出為 `ultra (F=64)`。若顯示 `base (F=32)`，代表代碼邏輯仍有干擾，須立即停機。
 
 ---
 *本規範基於「終極全通道完全體」版本更新。*
