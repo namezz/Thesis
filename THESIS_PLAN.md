@@ -39,13 +39,14 @@ Nested S-shaped Scan。透過條帶內 S 型走訪保持空間鄰近性，對於
 ## 3. 階段性研究規劃 (Phased Roadmap)
 
 ### 第一階段：混合式骨幹驗證 (Phase 1)
-- **架構**：Backbone + RefineNet。
+- **架構**：LGS Block (Audited NSS) + RefineNet (Tanh Residual)。
+- **規格**：Ultra 變體參數達 **14.12M**。
 - **訓練指令**：
 ```bash
 nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
 torchrun --nproc_per_node=1 train.py --phase 1 --variant ultra \
     --batch_size 8 --grad_accum 2 --data_path /josh/dataset/vimeo90k/vimeo_triplet \
-    --num_workers 12 --exp_name phase1_ultra > train_p1.log 2>&1 &
+    --num_workers 12 --exp_name phase1_ultra_final > train_p1.log 2>&1 &
 ```
 
 ### 第二階段：光流導引增強 (Phase 2)
