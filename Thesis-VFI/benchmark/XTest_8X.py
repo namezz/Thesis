@@ -33,7 +33,7 @@ else:
     # Fallback/Placeholder
     cfg.MODEL_CONFIG['LOGNAME'] = args.model
 
-model = Model(-1)
+model = Model(-1, cfg.MODEL_CONFIG)
 model.load_model()
 model.eval()
 model.device()

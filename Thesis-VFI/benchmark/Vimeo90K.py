@@ -28,7 +28,7 @@ if args.model == 'hybrid_v1_baseline':
 else:
     cfg.MODEL_CONFIG['LOGNAME'] = args.model
 
-model = Model(-1)
+model = Model(-1, cfg.MODEL_CONFIG)
 model.load_model()
 model.eval()
 model.device()

@@ -194,7 +194,15 @@ if __name__ == "__main__":
     
     # Unified Config Generation
     project_config.MODEL_CONFIG = project_config.get_phase_config(args.phase, args.variant)
-    if args.exp_name: project_config.MODEL_CONFIG['LOGNAME'] = args.exp_name
+    if args.exp_name:
+        project_config.MODEL_CONFIG['LOGNAME'] = args.exp_name
+    
+    if local_rank == 0:
+        print("="*40)
+        print(f"DEBUG: Selected Variant: {args.variant}")
+        print(f"DEBUG: Final LogName: {project_config.MODEL_CONFIG['LOGNAME']}")
+        print(f"DEBUG: Model F dim: {project_config.MODEL_CONFIG['MODEL_ARCH']['embed_dims'][0]}")
+        print("="*40)
     
     dist.init_process_group(backend="nccl", world_size=args.world_size, rank=local_rank)
     torch.cuda.set_device(local_rank)
@@ -203,7 +211,8 @@ if __name__ == "__main__":
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = True
     
-    model = Model(local_rank, backbone_lr_scale=args.backbone_lr_scale)
+    # Pass the actual generated config to the trainer
+    model = Model(local_rank, project_config.MODEL_CONFIG, backbone_lr_scale=args.backbone_lr_scale)
     
     # Auto-resume logic
     train_state = None

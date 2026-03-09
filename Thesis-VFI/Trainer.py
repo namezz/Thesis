@@ -5,17 +5,16 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from model import ThesisModel
 from model.loss import CompositeLoss
-from config import MODEL_CONFIG
 
 class Model:
-    def __init__(self, local_rank, backbone_lr_scale=1.0):
-        self.net = ThesisModel(MODEL_CONFIG['MODEL_ARCH'])
-        self.name = MODEL_CONFIG['LOGNAME']
+    def __init__(self, local_rank, config, backbone_lr_scale=1.0):
+        self.net = ThesisModel(config['MODEL_ARCH'])
+        self.name = config['LOGNAME']
         self.device_id = local_rank
         self.backbone_lr_scale = backbone_lr_scale
 
         # Phase-aware composite loss
-        phase = MODEL_CONFIG.get('PHASE', 1)
+        phase = config.get('PHASE', 1)
         self.loss_fn = CompositeLoss(phase=phase)
 
         # Move everything to GPU
