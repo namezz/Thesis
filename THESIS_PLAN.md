@@ -49,14 +49,22 @@ torchrun --nproc_per_node=1 train.py --phase 1 --variant ultra \
     --num_workers 12 --exp_name phase1_ultra_final > train_p1.log 2>&1 &
 ```
 
-### 第二階段：光流導引增強 (Phase 2)
-- **架構**：Backbone → OpticalFlowEstimator → Warp → ContextNet → RefineNet。
-- **新增模組**：~6.82M params。
-- **訓練策略**：從 Phase 1 最佳模型 resume，凍結 backbone 前 50 epoch。
+### 第二階段：光流導引增強 (Phase 2: Motion Guidance)
+**目標**：引入 `OpticalFlowEstimator` 與 `ContextNet` 特徵預對齊機制，大幅提升模型在 SNU-FILM Hard/Extreme 等大位移場景的表現。
 
-### 第三階段：4K 高保真合成 (Phase 3)
-- **策略**：Vimeo90K + X4K1000FPS 混合訓練。
-- **機制**：Sigmoid Curriculum Learning ($256 \to 384 \to 512$ crop)。
+*   **Flow Module**: 3-scale 特徵導引光流估計器，直接利用 Backbone 輸出的 **Path B (Per-frame pairs)** 進行精確匹配。
+*   **ContextNet**: 每幀獨立提取多尺度 CNN 特徵，隨光流進行 Warping 處理，為 `RefineNet` 提供豐富的對齊上下文。
+*   **微調策略**: 採用 **Freeze-then-Unfreeze**。前 50 個 Epoch 凍結已預訓練好的 Backbone (F=64)，專注於訓練光流與精煉模組，隨後開啟全模型微調以達成特徵協同。
+
+### 第三階段：4K 超高解析度細節保持 (Phase 3: 4K Synthesis)
+**目標**：透過課程學習與 X4K1000FPS 高解析度數據混合訓練，強化 4K 影片中的髮絲、紋理與銳利度。
+
+*   **Sigmoid Curriculum Learning**: 漸進式增大訓練 Patch 解析度。
+    *   Epoch 0 ~ T: $256 \times 256$ (快速暖身)
+    *   Epoch T ~ 2T: $384 \times 384$ (細節適應)
+    *   Epoch 2T ~ End: $512 \times 512$ (高解析度精修)
+*   **Mixed Training**: Vimeo90K 與 X4K1000FPS 混合採樣，比例隨 Epoch 採 Sigmoid 增長，使模型具備處理多樣化解析度的能力。
+*   **Scale Inference**: 支援 `--scale 0.25` 推論，在低解析度下預測光流，再於原圖解析度執行殘差補償。
 
 ---
 

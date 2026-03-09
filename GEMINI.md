@@ -22,7 +22,7 @@
 ## 常用工作流 (Workflows)
 
 ### 啟動與驗證 (Startup & Verification)
-1. **啟動 Ultra 訓練**:
+1. **Phase 1: 啟動 Ultra 訓練**:
 ```bash
 nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
 torchrun --nproc_per_node=1 train.py \
@@ -33,7 +33,31 @@ torchrun --nproc_per_node=1 train.py \
     --exp_name phase1_ultra_final > train_p1.log 2>&1 &
 ```
 
-2. **核心驗證 (防止跑錯變體)**:
+2. **Phase 2: 光流與微調**:
+```bash
+nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
+torchrun --nproc_per_node=1 train.py \
+    --phase 2 --variant ultra \
+    --batch_size 4 --grad_accum 4 \
+    --resume phase1_ultra_final_best \
+    --freeze_backbone 50 --backbone_lr_scale 0.1 \
+    --data_path /josh/dataset/vimeo90k/vimeo_triplet \
+    --exp_name phase2_ultra_flow > train_p2.log 2>&1 &
+```
+
+3. **Phase 3: 4K 課程學習**:
+```bash
+nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
+torchrun --nproc_per_node=1 train.py \
+    --phase 3 --variant ultra \
+    --batch_size 4 --grad_accum 4 \
+    --resume phase2_ultra_flow_best \
+    --x4k_path /josh/dataset/X4K1000FPS \
+    --curriculum --curriculum_T 33 \
+    --exp_name phase3_ultra_4k > train_p3.log 2>&1 &
+```
+
+4. **核心驗證 (防止跑錯變體)**:
    - 啟動後等待產生第一個 Checkpoint (約一個 Epoch)。
    - 執行 `python inspect_ckpt.py`。
    - **必須確認** 輸出為 `ultra (F=64)`。若顯示 `base (F=32)`，代表代碼邏輯仍有干擾，須立即停機。

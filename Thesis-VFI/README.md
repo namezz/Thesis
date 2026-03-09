@@ -158,6 +158,7 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.versio
 ### 快速啟動範例 (RTX 5000 48GB Optimized)
 
 **Phase 1：Backbone 預訓練 (Ultra)**
+*   **目標**：基礎特徵表徵學習。
 ```bash
 nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
 torchrun --nproc_per_node=1 train.py \
@@ -168,15 +169,35 @@ torchrun --nproc_per_node=1 train.py \
     --exp_name phase1_ultra_final > train_p1.log 2>&1 &
 ```
 
-**Phase 2：光流引導**
+**Phase 2：光流引導增強 (Motion Guidance)**
+*   **目標**：引入 `FlowEstimator` 解決大動作問題。從 Phase 1 最佳權重繼承，並凍結 Backbone 進行穩定微調。
 ```bash
 nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
 torchrun --nproc_per_node=1 train.py \
     --phase 2 --variant ultra \
+    --batch_size 4 --grad_accum 4 \
     --resume phase1_ultra_final_best \
-    --freeze_backbone 50 --backbone_lr_scale 0.1 \
+    --freeze_backbone 50 \
+    --backbone_lr_scale 0.1 \
     --data_path /josh/dataset/vimeo90k/vimeo_triplet \
+    --num_workers 8 \
     --exp_name phase2_ultra_flow > train_p2.log 2>&1 &
+```
+
+**Phase 3：4K 高保真合成 (4K Synthesis)**
+*   **目標**：透過混合訓練與課程學習提升高解析度細節。
+*   **策略**：開啟 Sigmoid Curriculum ($256 \to 384 \to 512$ crop)。
+```bash
+nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
+torchrun --nproc_per_node=1 train.py \
+    --phase 3 --variant ultra \
+    --batch_size 4 --grad_accum 4 \
+    --resume phase2_ultra_flow_best \
+    --x4k_path /josh/dataset/X4K1000FPS \
+    --curriculum --curriculum_T 33 \
+    --backbone_lr_scale 0.1 \
+    --num_workers 8 \
+    --exp_name phase3_ultra_4k > train_p3.log 2>&1 &
 ```
 
 ---
