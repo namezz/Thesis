@@ -189,7 +189,18 @@ if __name__ == "__main__":
     parser.add_argument('--curriculum_T', type=int, default=50)
     args = parser.parse_args()
     
-    local_rank = int(os.environ.get('LOCAL_RANK', args.local_rank))
+    # Enhanced Distributed Initialization
+    if 'WORLD_SIZE' in os.environ:
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        world_size = int(os.environ.get('WORLD_SIZE', 1))
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+    else:
+        local_rank = 0
+        world_size = 1
+        torch.cuda.set_device(0)
+        dist.init_process_group(backend="nccl", init_method='tcp://127.0.0.1:29505', world_size=1, rank=0)
+
     v_w, x_w = map(int, args.mixed_ratio.split(':'))
     
     # Unified Config Generation
@@ -203,9 +214,6 @@ if __name__ == "__main__":
         print(f"DEBUG: Final LogName: {project_config.MODEL_CONFIG['LOGNAME']}")
         print(f"DEBUG: Model F dim: {project_config.MODEL_CONFIG['MODEL_ARCH']['embed_dims'][0]}")
         print("="*40)
-    
-    dist.init_process_group(backend="nccl", world_size=args.world_size, rank=local_rank)
-    torch.cuda.set_device(local_rank)
     
     seed = 1234
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
