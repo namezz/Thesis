@@ -73,7 +73,8 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
     step_per_epoch = train_data.__len__()
     
     dataset_val = VimeoDataset('test', data_path)
-    val_data = DataLoader(dataset_val, batch_size=batch_size, pin_memory=True, num_workers=num_workers)
+    val_sampler = DistributedSampler(dataset_val, shuffle=False)
+    val_data = DataLoader(dataset_val, batch_size=batch_size, pin_memory=True, num_workers=num_workers, sampler=val_sampler)
     
     if local_rank == 0:
         print(f'Training with {logname}...')
@@ -113,11 +114,11 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
             learning_rate = get_learning_rate(step, step_per_epoch, total_epochs, base_lr=lr)
             
             if grad_accum > 1:
-                _, loss_dict = model.update(imgs, gt, learning_rate, training=True, accumulate=True)
+                _, loss_dict = model.update(imgs, gt, learning_rate, training=True, accumulate=True, grad_accum=grad_accum)
                 if (i + 1) % grad_accum == 0 or (i + 1) == len(train_data):
                     model.accum_step()
             else:
-                _, loss_dict = model.update(imgs, gt, learning_rate, training=True)
+                _, loss_dict = model.update(imgs, gt, learning_rate, training=True, accumulate=False)
             
             if step % 200 == 1 and local_rank == 0 and writer is not None:
                 writer.add_scalar('learning_rate', learning_rate, step)

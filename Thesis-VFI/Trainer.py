@@ -135,7 +135,7 @@ class Model:
             param.requires_grad = True
         print("Backbone parameters unfrozen.")
     
-    def update(self, imgs, gt, learning_rate=0, training=True, accumulate=False):
+    def update(self, imgs, gt, learning_rate=0, training=True, accumulate=False, grad_accum=1):
         # Discriminative LR: backbone gets scaled LR
         for param_group in self.optimG.param_groups:
             if param_group.get('name') == 'backbone':
@@ -159,22 +159,30 @@ class Model:
                 loss_total, loss_dict = self.loss_fn(
                     pred, gt, flow=flow, flow_backward=flow_bwd, img0=img0
                 )
+                
+                # 修改點：如果有開啟累積，必須先除以 grad_accum
+                if accumulate and grad_accum > 1:
+                    loss_total = loss_total / grad_accum
             
-            if not accumulate:
-                self.optimG.zero_grad()
             if self.scaler is not None:
                 self.scaler.scale(loss_total).backward()
             else:
                 loss_total.backward()
+
             if not accumulate:
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimG)
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+                
                 if self.scaler is not None:
                     self.scaler.step(self.optimG)
                     self.scaler.update()
                 else:
                     self.optimG.step()
+                
+                # 執行完 step 後才清空梯度
+                self.optimG.zero_grad() 
+                
             # Return finest prediction for visualization/metrics
             pred_out = pred[0] if isinstance(pred, (list, tuple)) else pred
             return pred_out, loss_dict
