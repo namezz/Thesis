@@ -142,6 +142,7 @@ class Model:
                 param_group['lr'] = learning_rate * self.backbone_lr_scale
             else:
                 param_group['lr'] = learning_rate
+                
         if training:
             self.train()
             x = torch.cat(imgs, dim=1) if isinstance(imgs, list) else imgs
@@ -150,9 +151,6 @@ class Model:
             amp_dtype = torch.bfloat16 if self.use_bf16 else torch.float16
             with torch.amp.autocast('cuda', dtype=amp_dtype):
                 pred, flow = self.net(x)
-                # pred is now a list of multi-scale predictions [finest, ..., coarsest]
-                # CompositeLoss handles list pred when multiscale_weights is set
-                # Split combined flow into forward/backward for occlusion-aware loss
                 flow_bwd = None
                 if flow is not None and flow.shape[1] >= 4:
                     flow_bwd = flow[:, 2:4]
@@ -160,15 +158,17 @@ class Model:
                     pred, gt, flow=flow, flow_backward=flow_bwd, img0=img0
                 )
                 
-                # 修改點：如果有開啟累積，必須先除以 grad_accum
+                # 2. 核心修復：累積梯度時，Loss 必須先除以累積步數
                 if accumulate and grad_accum > 1:
                     loss_total = loss_total / grad_accum
             
+            # 正常反向傳播
             if self.scaler is not None:
                 self.scaler.scale(loss_total).backward()
             else:
                 loss_total.backward()
 
+            # 3. 核心修復：不累積梯度時的更新邏輯
             if not accumulate:
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimG)
@@ -180,17 +180,22 @@ class Model:
                 else:
                     self.optimG.step()
                 
-                # 執行完 step 後才清空梯度
+                # 更新完畢後才清空梯度
                 self.optimG.zero_grad() 
                 
-            # Return finest prediction for visualization/metrics
             pred_out = pred[0] if isinstance(pred, (list, tuple)) else pred
             return pred_out, loss_dict
+            
         else: 
             self.eval()
             with torch.no_grad():
                 x = torch.cat(imgs, dim=1) if isinstance(imgs, list) else imgs
-                pred, _ = self.net(x)
+                
+                # 4. 核心修復：驗證階段也必須開啟混合精度，避免顯存爆滿
+                amp_dtype = torch.bfloat16 if self.use_bf16 else torch.float16
+                with torch.amp.autocast('cuda', dtype=amp_dtype):
+                    pred, _ = self.net(x)
+                    
                 pred_out = pred[0] if isinstance(pred, (list, tuple)) else pred
                 return pred_out, {}
 

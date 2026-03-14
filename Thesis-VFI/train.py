@@ -73,8 +73,12 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
     step_per_epoch = train_data.__len__()
     
     dataset_val = VimeoDataset('test', data_path)
-    val_sampler = DistributedSampler(dataset_val, shuffle=False)
-    val_data = DataLoader(dataset_val, batch_size=batch_size, pin_memory=True, num_workers=num_workers, sampler=val_sampler)
+    
+    # 新增：讓多卡平分驗證集 (單卡時會自動全吃)
+    val_sampler = DistributedSampler(dataset_val, shuffle=False) 
+    
+    # 修改：將 batch_size 降為 1，並放入 sampler
+    val_data = DataLoader(dataset_val, batch_size=1, pin_memory=True, num_workers=num_workers, sampler=val_sampler)
     
     if local_rank == 0:
         print(f'Training with {logname}...')
@@ -132,9 +136,16 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
             
             step += 1
             
+        # 迴圈剛結束的地方
+        if local_rank == 0:
+            print(f"========== DEBUG: 準備進入 Evaluation (Epoch {epoch}) ==========", flush=True)
+            
         nr_eval += 1
         if nr_eval % eval_interval == 0:
             evaluate(model, val_data, nr_eval, local_rank, writer_val=writer_val, best_psnr_holder=best_psnr_holder, dry_run=args.dry_run)
+        
+        if local_rank == 0:
+            print(f"========== DEBUG: Evaluation 完成，準備儲存 Checkpoint ==========", flush=True)
         
         train_state = {'epoch': epoch, 'step': step, 'nr_eval': nr_eval, 'best_psnr': best_psnr_holder['val']}
         model.save_model(local_rank, train_state=train_state)    
