@@ -77,8 +77,8 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
     # 新增：讓多卡平分驗證集 (單卡時會自動全吃)
     val_sampler = DistributedSampler(dataset_val, shuffle=False) 
     
-    # 修改：將 batch_size 降為 1，並放入 sampler
-    val_data = DataLoader(dataset_val, batch_size=1, pin_memory=True, num_workers=num_workers, sampler=val_sampler)
+    # 恢復使用原本的 batch_size
+    val_data = DataLoader(dataset_val, batch_size=batch_size, pin_memory=True, num_workers=num_workers, sampler=val_sampler)
     
     if local_rank == 0:
         print(f'Training with {logname}...')
