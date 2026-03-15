@@ -191,12 +191,23 @@ class Model:
             with torch.no_grad():
                 x = torch.cat(imgs, dim=1) if isinstance(imgs, list) else imgs
                 
-                # 4. 核心修復：驗證階段也必須開啟混合精度，避免顯存爆滿
+                # 確保解析度是 32 的倍數 (防止 Mamba/Warp 算子越界)
+                h, w = x.shape[2], x.shape[3]
+                ph = ((h - 1) // 32 + 1) * 32
+                pw = ((w - 1) // 32 + 1) * 32
+                padding = (0, pw - w, 0, ph - h)
+                x = torch.nn.functional.pad(x, padding)
+
                 amp_dtype = torch.bfloat16 if self.use_bf16 else torch.float16
                 with torch.amp.autocast('cuda', dtype=amp_dtype):
                     pred, _ = self.net(x)
+                
+                # 裁切回原始尺寸
+                if isinstance(pred, (list, tuple)):
+                    pred_out = pred[0][:, :, :h, :w]
+                else:
+                    pred_out = pred[:, :, :h, :w]
                     
-                pred_out = pred[0] if isinstance(pred, (list, tuple)) else pred
                 return pred_out, {}
 
     def accum_step(self):

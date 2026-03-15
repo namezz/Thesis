@@ -77,8 +77,8 @@ def train(model, local_rank, batch_size, data_path, x4k_path=None, mixed_ratio=(
     # 新增：讓多卡平分驗證集 (單卡時會自動全吃)
     val_sampler = DistributedSampler(dataset_val, shuffle=False) 
     
-    # 恢復使用原本的 batch_size
-    val_data = DataLoader(dataset_val, batch_size=batch_size, pin_memory=True, num_workers=num_workers, sampler=val_sampler)
+    # 設置 batch_size=1 用於驗證 (最穩定)
+    val_data = DataLoader(dataset_val, batch_size=1, pin_memory=True, num_workers=num_workers, sampler=val_sampler)
     
     if local_rank == 0:
         print(f'Training with {logname}...')
@@ -159,10 +159,17 @@ def evaluate(model, val_data, nr_eval, local_rank, writer_val=None, best_psnr_ho
         imgs, gt = imgs[:, 0:6], imgs[:, 6:]
         with torch.no_grad():
             pred, _ = model.update(imgs, gt, training=False)
+            # 強制同步捕捉非同步 CUDA 錯誤
+            torch.cuda.synchronize()
+            
         for j in range(gt.shape[0]):
             psnr_list.append(-10 * math.log10(((gt[j] - pred[j])**2).mean().cpu().item()))
             ssim_list.append(ssim_matlab(gt[j:j+1], pred[j:j+1]).cpu().item())
+        
+        # 嚴格清理
         del imgs, gt, pred
+        if i % 10 == 0:
+            torch.cuda.empty_cache()
    
     avg_psnr, avg_ssim = np.mean(psnr_list), np.mean(ssim_list)
     if local_rank == 0:
